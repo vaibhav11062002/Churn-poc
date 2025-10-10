@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.cluster import KMeans
 from google.cloud import storage
+from google.oauth2 import service_account
 import google.generativeai as genai
 
 # =========================
@@ -23,22 +24,44 @@ logging.basicConfig(
 logger = logging.getLogger("customer-insights")
 
 # =========================
-# Config for GCS and Vertex API key
+# Config for GCS and OAuth2 credentials
 # =========================
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
 GCS_BLOB_NAME = os.getenv("GCS_BLOB_NAME")
-VERTEX_API_KEY = os.getenv("VERTEX_API_KEY") or "AQ.Ab8RN6Js_U257WMEUfBO4rOK3gXLe0elpojCzXT5vnUb0uYxjQ"
+
+# Load Service Account JSON key from environment variable
+credentials_json_str = os.getenv("GEMINI_API_CREDENTIALS_JSON")
+if not credentials_json_str:
+    raise RuntimeError("GEMINI_API_CREDENTIALS_JSON environment variable is required")
+
+try:
+    keyfile_dict = json.loads(credentials_json_str)
+    credentials = service_account.Credentials.from_service_account_info(keyfile_dict)
+    logger.info("Loaded service account credentials successfully")
+except Exception as e:
+    logger.error(f"Failed to load service account credentials: {e}")
+    raise
+
+# Configure Google Generative AI client with OAuth2 credentials
+try:
+    genai.configure(credentials=credentials)
+    logger.info("Configured Google Generative AI client with OAuth2 credentials")
+except Exception as e:
+    logger.error(f"Failed to configure Google Generative AI client: {e}")
+    raise
 
 MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+model = genai.GenerativeModel(MODEL_NAME)
 
 CUSTOMER_COL = "Customer"
 REVENUE_COL = "Net Value"
-COMPANY_COL_CANDIDATES = ["Company Code", "company code", "company_code", "ccode to be billed", "c_code", "ccode"]
+COMPANY_COL_CANDIDATES = [
+    "Company Code", "company code", "company_code", "ccode to be billed", "c_code", "ccode"
+]
 SALES_DOC_CANDIDATES = [
     "Sales Document", "Sales Document Number", "Billing Document", "Billing Doc",
     "Invoice Number", "Invoice", "Document Number"
 ]
-
 KEEP_COLS = [
     "Billing Date", "Created On", "Item Description",
     "Material Group", "Distribution Channel", "Terms of Payment",
@@ -46,18 +69,7 @@ KEEP_COLS = [
 ]
 
 # =========================
-# Initialize Google Generative AI Client with Vertex API Key
-# =========================
-try:
-    genai.configure(api_key=VERTEX_API_KEY)
-    model = genai.GenerativeModel(MODEL_NAME)
-    logger.info("Configured Google Generative AI with Vertex API key")
-except Exception as e:
-    logger.error(f"Failed to configure Google Generative AI client: {e}")
-    raise
-
-# =========================
-# Helpers
+# Helper functions
 # =========================
 def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols_lc = {c.lower(): c for c in df.columns}
@@ -95,7 +107,6 @@ def build_codebook(series: pd.Series) -> Dict[str, str]:
     return {v: f"x{i+1}" for i, v in enumerate(vc.index.tolist())}
 
 def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int]:
-    # Use ALL rows for this customer, sorted by date if present
     g = cust_df.copy()
     date_cols = [c for c in ["Billing Date", "Created On"] if c in g.columns]
     date_col = date_cols[0] if date_cols else None
@@ -232,7 +243,7 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
 
     return a
 
-# Prompt template from your local code
+# Prompt template (from your local code)
 PROMPT_TEMPLATE = """
 You are a data analyst. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
 
@@ -323,7 +334,6 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
         "observation": str(obj.get("observation", "")),
         "recommendation": str(obj.get("recommendation", "")),
     }
-    # numeric dicts
     for dict_key, legacy in [("revenue_by_year", "revenue_by_year"), ("revenue_by_quarter", "revenue_by_quarter")]:
         rb = obj.get(dict_key, obj.get(legacy, {}))
         if isinstance(rb, dict):
@@ -334,7 +344,6 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
                 except Exception:
                     fixed[str(k)] = 0.0
             out[dict_key] = fixed
-    # list of dicts
     bp = obj.get("best_price_by_material", obj.get("best_price_by_material", []))
     if isinstance(bp, list):
         cleaned = []
@@ -347,7 +356,6 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
                 "discount": str(item.get("discount", "")),
             })
         out["best_price_by_material"] = cleaned
-    # trim short fields (do not trim observation/recommendation to allow 75+ words)
     def trim_words(s: str, n: int) -> str:
         toks = str(s).split()
         return " ".join(toks[:n])
@@ -357,7 +365,6 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
     out["Purchase_details"] = trim_words(out["Purchase_details"], 20)
     out["trend_of_sales"] = trim_words(out["trend_of_sales"], 40)
     out["product_combination"] = trim_words(out["product_combination"], 20)
-    # normalize churn
     churn = out["churn"].strip().lower()
     if churn not in {"yes", "no"}:
         out["churn"] = ""
@@ -383,7 +390,7 @@ def load_df_from_gcs(bucket_name: str, blob_name: str) -> pd.DataFrame:
         raise
 
 # =========================
-# Cluster logic (same as before with 3 clusters)
+# Cluster logic (3 clusters)
 # =========================
 def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     g = g.copy()
@@ -407,7 +414,7 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     return g.drop(columns=["rev_pos", "km_id"])
 
 # =========================
-# Load data and cluster at startup with error handling and logging
+# Load data and cluster at startup with logging
 # =========================
 try:
     raw_df = load_df_from_gcs(GCS_BUCKET_NAME, GCS_BLOB_NAME)
@@ -614,7 +621,3 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     except Exception as e:
         logger.error(f"Unexpected error in get_customer_insights for customer {customer_id}: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
-
-# =========================
-# End of code
-# =========================
