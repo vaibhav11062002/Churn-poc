@@ -1,7 +1,7 @@
-# main.py (Cloud-Ready Version)
+# main.py (Cloud-Ready Vertex AI version)
 # 1) Reads input CSV from Google Cloud Storage (GCS), clusters customers, and holds in memory.
 # 2) GET /clustered-data returns clustered data as JSON.
-# 3) GET /customer-insights/{customer_id} sends customer history to an LLM for analysis.
+# 3) GET /customer-insights/{customer_id} sends customer history to a Gemini model for analysis via Vertex AI.
 
 import os
 import re
@@ -18,8 +18,11 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.cluster import KMeans
-import google.generativeai as genai
-from google.cloud import storage # <-- ADDED for GCS
+from google.cloud import storage  # For GCS
+
+# Use the unified Google Gen AI SDK (Vertex AI mode)
+from google import genai
+from google.genai import types
 
 # =========================
 # Logging
@@ -33,16 +36,28 @@ logger = logging.getLogger("customer-insights")
 # =========================
 # Config
 # =========================
-# The input CSV is now loaded from Google Cloud Storage for cloud-native deployment.
-# These values are set via environment variables in the Cloud Run deployment.
+# CSV is loaded from Google Cloud Storage; set these in Cloud Run service.
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
 GCS_BLOB_NAME = os.getenv("GCS_BLOB_NAME")
 
-API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+# Vertex AI API key and project/location
+API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+VERTEX_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
+VERTEX_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+
 if not API_KEY:
-    logger.warning("GEMINI_API_KEY/GOOGLE_API_KEY not set; LLM calls will fail until configured.")
-genai.configure(api_key=API_KEY)
-MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash") # Updated model name
+    logger.warning("GOOGLE_API_KEY/GEMINI_API_KEY not set; LLM calls will fail until configured.")
+
+# Initialize Google Gen AI SDK in Vertex mode (v1)
+client = genai.Client(
+    vertexai=True,
+    api_key=API_KEY,
+    project=VERTEX_PROJECT,
+    location=VERTEX_LOCATION,
+    http_options=types.HttpOptions(api_version="v1"),
+)
+
+MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
 
 CUSTOMER_COL = "Customer"
 REVENUE_COL = "Net Value"
@@ -78,14 +93,14 @@ def resilient_read_csv(filepath_or_buffer: Union[str, Path, io.StringIO]) -> pd.
             return pd.read_csv(filepath_or_buffer, dtype=str, encoding=enc, engine="c", sep=",", low_memory=False)
         except Exception:
             if isinstance(filepath_or_buffer, io.StringIO):
-                filepath_or_buffer.seek(0) # Reset buffer for next try
+                filepath_or_buffer.seek(0)  # Reset buffer for next try
             pass
     for enc in encodings:
         try:
             return pd.read_csv(filepath_or_buffer, dtype=str, encoding=enc, engine="python", sep=None)
         except Exception:
             if isinstance(filepath_or_buffer, io.StringIO):
-                filepath_or_buffer.seek(0) # Reset buffer for next try
+                filepath_or_buffer.seek(0)
             pass
     raise ValueError("Failed to parse CSV after multiple strategies.")
 
@@ -97,13 +112,11 @@ def load_df_from_gcs(bucket_name: str, blob_name: str) -> pd.DataFrame:
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    
+
     logger.info("Downloading blob '%s' from bucket '%s'...", blob_name, bucket_name)
-    # Download blob as text and use io.StringIO to let pandas read it from memory
     data_string = blob.download_as_text()
     logger.info("Blob downloaded, parsing with resilient_read_csv.")
     return resilient_read_csv(io.StringIO(data_string))
-
 
 def sanitize_text(x: Any) -> str:
     if pd.isna(x):
@@ -169,8 +182,6 @@ def quarter_key_from_period_str(s: str) -> str:
     return s.replace("Q", "-Q")
 
 def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
-    # This function remains unchanged.
-    # ... (code for this function is identical to your original)
     a: Dict[str, Any] = {}
     g = cust_df.copy()
     date_cols = [c for c in ["Billing Date", "Created On"] if c in g.columns]
@@ -273,7 +284,6 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
 # =========================
 # Load data & cluster at startup
 # =========================
-# The startup logic is now updated to call the GCS loading function.
 raw_df = load_df_from_gcs(GCS_BUCKET_NAME, GCS_BLOB_NAME)
 logger.info("CSV loaded with shape=%s columns=%d", raw_df.shape, len(raw_df.columns))
 
@@ -337,9 +347,8 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
         g["cluster_name"] = labels
         g["cluster_id"] = g["cluster_name"].map({"high_revenue": 0, "mixed_revenue": 1, "low_revenue": 2}).fillna(2).astype(int)
         return g.drop(columns=["rev_pos"])
-    
     X = np.log1p(g["rev_pos"]).to_numpy().reshape(-1, 1)
-    km = KMeans(n_clusters=3, n_init=10, random_state=42) # n_init changed for newer scikit-learn
+    km = KMeans(n_clusters=3, n_init=10, random_state=42)
     g["km_id"] = km.fit_predict(X)
     means = g.groupby("km_id")["rev_pos"].mean().sort_values(ascending=False)
     order = {cid: idx for idx, cid in enumerate(means.index)}
@@ -369,7 +378,6 @@ logger.info("clustered_data rows=%d, sample=%s", len(clustered_data), clustered_
 # =========================
 # Prompt
 # =========================
-# This section remains unchanged.
 PROMPT_TEMPLATE = """
 You are a data analyst. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
 
@@ -416,8 +424,6 @@ Rules:
 6) Output MUST be a single JSON object exactly per schema.
 """.strip()
 
-# All helper functions for the prompt and response parsing remain unchanged.
-# ... (build_main_prompt, try_parse_json, coerce_to_schema_with_cluster)
 def build_main_prompt(customer_id: str,
                       known_total_revenue: float,
                       aggregates_json: Dict[str, Any],
@@ -480,19 +486,17 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
 
     def trim_words(s: str, n: int) -> str:
         return " ".join(str(s).split()[:n])
-    
+
     out["reason_churn_decision"] = trim_words(out["reason_churn_decision"], 20)
     out["how_to_retain"] = trim_words(out["how_to_retain"], 20)
     out["offers_we_can_provide"] = trim_words(out["offers_we_can_provide"], 20)
     out["details"] = trim_words(out["details"], 20)
     out["trend_of_buying"] = trim_words(out["trend_of_buying"], 40)
     out["product_combination"] = trim_words(out["product_combination"], 20)
-    
+
     churn = out["churn"].strip().lower()
     out["churn"] = churn if churn in {"yes", "no"} else ""
     return out
-
-model = genai.GenerativeModel(MODEL_NAME)
 
 # =========================
 # FastAPI
@@ -522,7 +526,6 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     if cust_df.empty:
         raise HTTPException(status_code=404, detail="Customer not found")
 
-    # ... The rest of this endpoint function remains unchanged ...
     known_total_revenue = float(cust_df[REVENUE_COL].fillna(0).sum())
     aggregates_json = compute_aggregates_for_customer(cust_df)
     compact, nlines = full_transaction_block_for_customer(cust_df)
@@ -548,7 +551,10 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
 
     raw_text = ""
     try:
-        resp = model.generate_content(prompt)
+        resp = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+        )
         raw_text = (resp.text or "")
         logger.info("LLM raw_text_len=%d", len(raw_text))
         parsed = try_parse_json(raw_text)
@@ -568,5 +574,5 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         return {"result": fallback, "debug": {"raw_text_head": raw_text[:400], "parsed": False}}
     return fallback
 
-# Example run command (for local testing, requires `gcloud auth application-default login`):
-# GCS_BUCKET_NAME="your-bucket" GCS_BLOB_NAME="llm_all_cust.csv" GEMINI_API_KEY="your-key" uvicorn main:app --reload --port 8000
+# Example local run:
+# GCS_BUCKET_NAME="your-bucket" GCS_BLOB_NAME="llm_all_cust.csv" GOOGLE_API_KEY="vertex-api-key" uvicorn main:app --reload --port 8000
