@@ -1,9 +1,7 @@
 # requirements.txt
-google-genai>=1.0.0
-fastapi>=0.111.0
-uvicorn[standard]>=0.30.0
-gunicorn>=22.0.0
+google-generativeai
+fastapi
+uvicorn[standard]
 pandas>=2.2.2
-numpy>=2.0.0
-scikit-learn>=1.4.0
-google-cloud-storage>=2.16.0
+numpy>=1.26.4,<2.0
+scikit-learn>=1.4
