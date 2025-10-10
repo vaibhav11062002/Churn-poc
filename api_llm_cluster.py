@@ -54,7 +54,7 @@ else:
     # Parse the JSON string into a dictionary
     credentials_info = json.loads(credentials_json_str)
     # Create credentials from the info
-    credentials, project_id = google.auth.load_credentials_from_info(credentials_info)
+    credentials, project_id = google.auth.load_credentials_from_dict(credentials_info)
 
 # Configure the genai library with these credentials
 genai.configure(credentials=credentials)
