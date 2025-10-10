@@ -1,6 +1,8 @@
 fastapi
-uvicorn[standard]
-pandas>=2.2.2
-numpy>=1.26.4,<2.0
-scikit-learn>=1.4
+uvicorn
+pandas
+scikit-learn
 google-generativeai
+google-cloud-storage
+numpy
+gunicorn
