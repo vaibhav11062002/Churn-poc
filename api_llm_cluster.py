@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.cluster import KMeans
 import google.generativeai as genai
-from google.cloud import storage  # <-- ADDED for GCS
+from google.cloud import storage # <-- ADDED for GCS
 
 # =========================
 # Logging
@@ -38,58 +38,24 @@ logger = logging.getLogger("customer-insights")
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
 GCS_BLOB_NAME = os.getenv("GCS_BLOB_NAME")
 
-MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")  # Updated model name
-
-# =========================
-# NEW - AUTHENTICATION SETUP
-# =========================
-import google.auth
-
-# Get the full JSON string from the environment variable we will set up in Cloud Run
-# We will use a new name to avoid confusion: GEMINI_API_CREDENTIALS
-credentials_json_str = os.environ.get("GEMINI_API_CREDENTIALS")
-if not credentials_json_str:
-    logger.error("GEMINI_API_CREDENTIALS environment variable not set.")
-    # Or raise ValueError("GEMINI_API_CREDENTIALS not set...")
-    credentials = None
-else:
-    # Parse the JSON string into a dictionary
-    credentials_info = json.loads(credentials_json_str)
-    # Create credentials from the info
-    credentials, project_id = google.auth.load_credentials_from_info(credentials_info)
-
-# Configure the genai library with these credentials
-genai.configure(credentials=credentials)
-
-# Now, initialize the model
-# =========================
-
-MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")  # Updated model name
+API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+if not API_KEY:
+    logger.warning("GEMINI_API_KEY/GOOGLE_API_KEY not set; LLM calls will fail until configured.")
+genai.configure(api_key=API_KEY)
+MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash") # Updated model name
 
 CUSTOMER_COL = "Customer"
 REVENUE_COL = "Net Value"
 COMPANY_COL_CANDIDATES = ["Company Code", "company code", "company_code", "ccode to be billed", "c_code", "ccode"]
 SALES_DOC_CANDIDATES = [
-    "Sales Document",
-    "Sales Document Number",
-    "Billing Document",
-    "Billing Doc",
-    "Invoice Number",
-    "Invoice",
-    "Document Number",
+    "Sales Document", "Sales Document Number", "Billing Document", "Billing Doc",
+    "Invoice Number", "Invoice", "Document Number"
 ]
 
 KEEP_COLS = [
-    "Billing Date",
-    "Created On",
-    "Item Description",
-    "Material Group",
-    "Distribution Channel",
-    "Terms of Payment",
-    "Order Quantity",
-    "Net Price",
-    "Net Value",
-    "Document Currency",
+    "Billing Date", "Created On", "Item Description",
+    "Material Group", "Distribution Channel", "Terms of Payment",
+    "Order Quantity", "Net Price", "Net Value", "Document Currency"
 ]
 
 # =========================
@@ -104,7 +70,6 @@ def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
             return cols_lc[name.lower()]
     return None
 
-
 def resilient_read_csv(filepath_or_buffer: Union[str, Path, io.StringIO]) -> pd.DataFrame:
     """Reads a CSV robustly from a path or an in-memory buffer."""
     encodings = ["utf-8-sig", "utf-8", "cp1252", "latin1"]
@@ -113,17 +78,16 @@ def resilient_read_csv(filepath_or_buffer: Union[str, Path, io.StringIO]) -> pd.
             return pd.read_csv(filepath_or_buffer, dtype=str, encoding=enc, engine="c", sep=",", low_memory=False)
         except Exception:
             if isinstance(filepath_or_buffer, io.StringIO):
-                filepath_or_buffer.seek(0)  # Reset buffer for next try
+                filepath_or_buffer.seek(0) # Reset buffer for next try
             pass
     for enc in encodings:
         try:
             return pd.read_csv(filepath_or_buffer, dtype=str, encoding=enc, engine="python", sep=None)
         except Exception:
             if isinstance(filepath_or_buffer, io.StringIO):
-                filepath_or_buffer.seek(0)  # Reset buffer for next try
+                filepath_or_buffer.seek(0) # Reset buffer for next try
             pass
     raise ValueError("Failed to parse CSV after multiple strategies.")
-
 
 def load_df_from_gcs(bucket_name: str, blob_name: str) -> pd.DataFrame:
     """Downloads a CSV from GCS and loads it into a resilient DataFrame."""
@@ -133,7 +97,7 @@ def load_df_from_gcs(bucket_name: str, blob_name: str) -> pd.DataFrame:
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
-
+    
     logger.info("Downloading blob '%s' from bucket '%s'...", blob_name, bucket_name)
     # Download blob as text and use io.StringIO to let pandas read it from memory
     data_string = blob.download_as_text()
@@ -149,13 +113,11 @@ def sanitize_text(x: Any) -> str:
     s = s.replace("|", "/")
     return s
 
-
 def norm_date(d):
     if pd.isna(d):
         return ""
     val = pd.to_datetime(d, errors="coerce")
     return val.strftime("%Y%m%d") if pd.notna(val) else ""
-
 
 def norm_num(x, ndigits=2):
     if pd.isna(x):
@@ -165,11 +127,9 @@ def norm_num(x, ndigits=2):
     except (ValueError, TypeError):
         return ""
 
-
 def build_codebook(series: pd.Series) -> Dict[str, str]:
     vc = series.dropna().astype(str).value_counts()
     return {v: f"x{i+1}" for i, v in enumerate(vc.index.tolist())}
-
 
 def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int]:
     g = cust_df.copy()
@@ -180,17 +140,7 @@ def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int
 
     keep_cols = [c for c in KEEP_COLS if c in g.columns]
     codebooks: Dict[str, Dict[str, str]] = {}
-    cat_cols = [
-        c
-        for c in [
-            "Item Description",
-            "Material Group",
-            "Distribution Channel",
-            "Terms of Payment",
-            "Document Currency",
-        ]
-        if c in g.columns
-    ]
+    cat_cols = [c for c in ["Item Description", "Material Group", "Distribution Channel", "Terms of Payment", "Document Currency"] if c in g.columns]
     for c in cat_cols:
         codebooks[c] = build_codebook(g[c])
 
@@ -215,10 +165,8 @@ def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int
     compact_text = "\n".join([header, code_header] + data_lines)
     return compact_text, len(data_lines)
 
-
 def quarter_key_from_period_str(s: str) -> str:
     return s.replace("Q", "-Q")
-
 
 def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
     # This function remains unchanged.
@@ -352,20 +300,18 @@ if "Net Price" in raw_df.columns:
 
 raw_df[CUSTOMER_COL] = raw_df[CUSTOMER_COL].astype(str)
 
-logger.info(
-    "Non-null counts: Customer=%d, Net Value=%d, Created On=%d, Billing Date=%d",
-    raw_df[CUSTOMER_COL].notna().sum(),
-    raw_df[REVENUE_COL].notna().sum(),
-    raw_df["Created On"].notna().sum() if "Created On" in raw_df.columns else -1,
-    raw_df["Billing Date"].notna().sum() if "Billing Date" in raw_df.columns else -1,
-)
+logger.info("Non-null counts: Customer=%d, Net Value=%d, Created On=%d, Billing Date=%d",
+            raw_df[CUSTOMER_COL].notna().sum(),
+            raw_df[REVENUE_COL].notna().sum(),
+            raw_df["Created On"].notna().sum() if "Created On" in raw_df.columns else -1,
+            raw_df["Billing Date"].notna().sum() if "Billing Date" in raw_df.columns else -1)
 
 # Aggregate revenue per (company, customer)
 agg = (
     raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[REVENUE_COL]
-    .sum(min_count=1)
-    .reset_index()
-    .rename(columns={REVENUE_COL: "total_revenue"})
+          .sum(min_count=1)
+          .reset_index()
+          .rename(columns={REVENUE_COL: "total_revenue"})
 )
 agg["total_revenue"] = agg["total_revenue"].fillna(0.0).astype(float)
 
@@ -374,14 +320,13 @@ sales_doc_col = find_col(raw_df, SALES_DOC_CANDIDATES)
 if sales_doc_col and sales_doc_col in raw_df.columns:
     pf = (
         raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[sales_doc_col]
-        .nunique(dropna=True)
-        .reset_index()
-        .rename(columns={sales_doc_col: "purchasing_frequency"})
+              .nunique(dropna=True)
+              .reset_index()
+              .rename(columns={sales_doc_col: "purchasing_frequency"})
     )
 else:
     pf = agg[[company_col, CUSTOMER_COL]].copy()
     pf["purchasing_frequency"] = 0
-
 
 def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     g = g.copy()
@@ -392,16 +337,15 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
         g["cluster_name"] = labels
         g["cluster_id"] = g["cluster_name"].map({"high_revenue": 0, "mixed_revenue": 1, "low_revenue": 2}).fillna(2).astype(int)
         return g.drop(columns=["rev_pos"])
-
+    
     X = np.log1p(g["rev_pos"]).to_numpy().reshape(-1, 1)
-    km = KMeans(n_clusters=3, n_init=10, random_state=42)  # n_init changed for newer scikit-learn
+    km = KMeans(n_clusters=3, n_init=10, random_state=42) # n_init changed for newer scikit-learn
     g["km_id"] = km.fit_predict(X)
     means = g.groupby("km_id")["rev_pos"].mean().sort_values(ascending=False)
     order = {cid: idx for idx, cid in enumerate(means.index)}
     g["cluster_id"] = g["km_id"].map(order)
     g["cluster_name"] = g["cluster_id"].map({0: "high_revenue", 1: "mixed_revenue", 2: "low_revenue"})
     return g.drop(columns=["rev_pos", "km_id"])
-
 
 clustered_list = []
 for _, g in agg.groupby(company_col, dropna=False):
@@ -410,18 +354,16 @@ clustered = pd.concat(clustered_list, ignore_index=True)
 
 clustered["revenue_rank_in_cluster"] = (
     clustered.groupby([company_col, "cluster_id"])["total_revenue"]
-    .rank(method="dense", ascending=False)
-    .astype(int)
+             .rank(method="dense", ascending=False)
+             .astype(int)
 )
 
 clustered = (
     clustered.merge(pf, on=[company_col, CUSTOMER_COL], how="left")
-    .rename(columns={company_col: "company_code", CUSTOMER_COL: "customer"})
+             .rename(columns={company_col: "company_code", CUSTOMER_COL: "customer"})
 )
 
-clustered_data = clustered[
-    ["company_code", "customer", "total_revenue", "cluster_name", "revenue_rank_in_cluster", "purchasing_frequency"]
-].copy()
+clustered_data = clustered[["company_code", "customer", "total_revenue", "cluster_name", "revenue_rank_in_cluster", "purchasing_frequency"]].copy()
 logger.info("clustered_data rows=%d, sample=%s", len(clustered_data), clustered_data.head(3).to_dict("records"))
 
 # =========================
@@ -474,16 +416,13 @@ Rules:
 6) Output MUST be a single JSON object exactly per schema.
 """.strip()
 
-
 # All helper functions for the prompt and response parsing remain unchanged.
 # ... (build_main_prompt, try_parse_json, coerce_to_schema_with_cluster)
-def build_main_prompt(
-    customer_id: str,
-    known_total_revenue: float,
-    aggregates_json: Dict[str, Any],
-    compact_block: str,
-    context_json: Dict[str, Any],
-) -> str:
+def build_main_prompt(customer_id: str,
+                      known_total_revenue: float,
+                      aggregates_json: Dict[str, Any],
+                      compact_block: str,
+                      context_json: Dict[str, Any]) -> str:
     prompt = PROMPT_TEMPLATE
     prompt = prompt.replace("[[CUSTOMER_ID]]", json.dumps(customer_id, ensure_ascii=False))
     prompt = prompt.replace("[[KNOWN_TOTAL_REVENUE]]", str(round(float(known_total_revenue or 0.0), 4)))
@@ -491,7 +430,6 @@ def build_main_prompt(
     prompt = prompt.replace("[[CONTEXT_JSON]]", json.dumps(context_json, separators=(",", ":"), ensure_ascii=False))
     prompt = prompt.replace("[[COMPACT_BLOCK]]", compact_block)
     return prompt
-
 
 def try_parse_json(text: str):
     try:
@@ -506,7 +444,6 @@ def try_parse_json(text: str):
         except Exception:
             pass
     return None
-
 
 # =========================
 # ONLY CHANGE: Response field names mapping (renamed fields)
@@ -546,18 +483,15 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
         cleaned = []
         for item in bp:
             if isinstance(item, dict):
-                cleaned.append(
-                    {
-                        "material": str(item.get("material", "")),
-                        "suggested_price": float(item.get("suggested_price", 0) or 0),
-                        "discount": str(item.get("discount", "")),
-                    }
-                )
+                cleaned.append({
+                    "material": str(item.get("material", "")),
+                    "suggested_price": float(item.get("suggested_price", 0) or 0),
+                    "discount": str(item.get("discount", "")),
+                })
         out["best_price_by_material"] = cleaned
     # Trim short fields (do not trim observation/recommendation to preserve longer text)
     def trim_words(s: str, n: int) -> str:
         return " ".join(str(s).split()[:n])
-
     out["churn_analysis"] = trim_words(out["churn_analysis"], 20)
     out["retention_strategies"] = trim_words(out["retention_strategies"], 20)
     out["Retention_offers"] = trim_words(out["Retention_offers"], 20)
@@ -568,7 +502,6 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
     churn = out["churn"].strip().lower()
     out["churn"] = churn if churn in {"yes", "no"} else ""
     return out
-
 
 model = genai.GenerativeModel(MODEL_NAME)
 
@@ -584,17 +517,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 @app.get("/health")
 async def health():
     return {"status": "ok", "rows": int(len(raw_df)), "clustered_rows": int(len(clustered_data))}
-
 
 @app.get("/clustered-data")
 async def get_clustered_data():
     logger.info("GET /clustered-data")
     return clustered_data.to_dict(orient="records")
-
 
 @app.get("/customer-insights/{customer_id}")
 async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
