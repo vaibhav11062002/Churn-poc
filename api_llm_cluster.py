@@ -38,11 +38,32 @@ logger = logging.getLogger("customer-insights")
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
 GCS_BLOB_NAME = os.getenv("GCS_BLOB_NAME")
 
-API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-if not API_KEY:
-    logger.warning("GEMINI_API_KEY/GOOGLE_API_KEY not set; LLM calls will fail until configured.")
-genai.configure(api_key=API_KEY)
-MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash") # Updated model name
+# =========================
+# NEW - AUTHENTICATION SETUP
+# =========================
+import google.auth
+
+# Get the full JSON string from the environment variable we will set up in Cloud Run
+# We will use a new name to avoid confusion: GEMINI_API_CREDENTIALS
+credentials_json_str = os.environ.get("GEMINI_API_CREDENTIALS")
+if not credentials_json_str:
+    logger.error("GEMINI_API_CREDENTIALS environment variable not set.")
+    # Or raise ValueError("GEMINI_API_CREDENTIALS not set...")
+    credentials = None
+else:
+    # Parse the JSON string into a dictionary
+    credentials_info = json.loads(credentials_json_str)
+    # Create credentials from the info
+    credentials, project_id = google.auth.load_credentials_from_info(credentials_info)
+
+# Configure the genai library with these credentials
+genai.configure(credentials=credentials)
+
+# Now, initialize the model
+model = genai.GenerativeModel(MODEL_NAME)
+# =========================
+
+MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash") # Updated model name
 
 CUSTOMER_COL = "Customer"
 REVENUE_COL = "Net Value"
@@ -503,7 +524,6 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
     out["churn"] = churn if churn in {"yes", "no"} else ""
     return out
 
-model = genai.GenerativeModel(MODEL_NAME)
 
 # =========================
 # FastAPI
