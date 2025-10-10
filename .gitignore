@@ -1,0 +1,27 @@
+/churn.py
+/customer segmentation.csv
+/customer_clusters_new.csv
+/customer_segmentation.py
+/customer_segmentation_summary_20251010_115308.csv
+/final_clustering_llm.py
+/final_llm_clustering.py
+/frontend.py
+/key.json
+/llm.py
+/llm_multiple_customer.py
+/llm_with_clustering.py
+/new_llm.py
+/new_llm_2025.csv
+/new_llm_2025_jan.csv
+/new_llm_data.xlsx
+/new_llm_full_data.csv
+/out
+/page1.py
+/pages
+/per_customer_wide_fullhistory.csv
+/test1.py
+/test2.py
+/test3.py
+/test4.py
+/transposed_llm.py
+/__pycache__
