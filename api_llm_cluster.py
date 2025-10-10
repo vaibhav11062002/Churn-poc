@@ -445,27 +445,39 @@ def try_parse_json(text: str):
             pass
     return None
 
+# =========================
+# ONLY CHANGE: Response field names mapping (renamed fields)
+# =========================
 def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster_name: str) -> Dict[str, Any]:
+    # Map model's original keys to the requested renamed output fields.
     out = {
         "customer": str(obj.get("customer", customer_id or "")),
         "cluster": str(cluster_name or obj.get("cluster", "")),
         "churn": str(obj.get("churn", "")),
-        "reason_churn_decision": str(obj.get("reason_churn_decision", "")),
-        "how_to_retain": str(obj.get("how_to_retain", "")),
-        "offers_we_can_provide": str(obj.get("offers_we_can_provide", "")),
-        "details": str(obj.get("details", "")),
+        "churn_analysis": str(obj.get("reason_churn_decision", "")),
+        "retention_strategies": str(obj.get("how_to_retain", "")),
+        "Retention_offers": str(obj.get("offers_we_can_provide", "")),
+        "Purchase_details": str(obj.get("details", "")),
         "revenue_by_year": {},
         "revenue_by_quarter": {},
-        "trend_of_buying": str(obj.get("trend_of_buying", "")),
+        "trend_of_sales": str(obj.get("trend_of_buying", "")),
         "product_combination": str(obj.get("product_combination", "")),
         "best_price_by_material": [],
         "observation": str(obj.get("observation", "")),
         "recommendation": str(obj.get("recommendation", "")),
     }
-    for dict_key in ["revenue_by_year", "revenue_by_quarter"]:
-        rb = obj.get(dict_key, {})
+    # Convert numeric dicts
+    for dict_key_src, dict_key_dst in [("revenue_by_year", "revenue_by_year"), ("revenue_by_quarter", "revenue_by_quarter")]:
+        rb = obj.get(dict_key_src, {})
         if isinstance(rb, dict):
-            out[dict_key] = {str(k): float(v) if isinstance(v, (int, float)) else 0.0 for k, v in rb.items()}
+            fixed = {}
+            for k, v in rb.items():
+                try:
+                    fixed[str(k)] = float(v)
+                except Exception:
+                    fixed[str(k)] = 0.0
+            out[dict_key_dst] = fixed
+    # Normalize best_price_by_material list
     bp = obj.get("best_price_by_material", [])
     if isinstance(bp, list):
         cleaned = []
@@ -477,17 +489,16 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
                     "discount": str(item.get("discount", "")),
                 })
         out["best_price_by_material"] = cleaned
-
+    # Trim short fields (do not trim observation/recommendation to preserve longer text)
     def trim_words(s: str, n: int) -> str:
         return " ".join(str(s).split()[:n])
-    
-    out["reason_churn_decision"] = trim_words(out["reason_churn_decision"], 20)
-    out["how_to_retain"] = trim_words(out["how_to_retain"], 20)
-    out["offers_we_can_provide"] = trim_words(out["offers_we_can_provide"], 20)
-    out["details"] = trim_words(out["details"], 20)
-    out["trend_of_buying"] = trim_words(out["trend_of_buying"], 40)
+    out["churn_analysis"] = trim_words(out["churn_analysis"], 20)
+    out["retention_strategies"] = trim_words(out["retention_strategies"], 20)
+    out["Retention_offers"] = trim_words(out["Retention_offers"], 20)
+    out["Purchase_details"] = trim_words(out["Purchase_details"], 20)
+    out["trend_of_sales"] = trim_words(out["trend_of_sales"], 40)
     out["product_combination"] = trim_words(out["product_combination"], 20)
-    
+    # Normalize churn
     churn = out["churn"].strip().lower()
     out["churn"] = churn if churn in {"yes", "no"} else ""
     return out
