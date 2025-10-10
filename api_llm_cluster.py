@@ -1,7 +1,8 @@
-# main.py (Cloud-Ready Vertex AI version)
-# 1) Reads input CSV from Google Cloud Storage (GCS), clusters customers, and holds in memory.
+# api_llm_cluster.py
+# Cloud-Ready Vertex AI version:
+# 1) Reads CSV from GCS, clusters customers, and holds results in memory.
 # 2) GET /clustered-data returns clustered data as JSON.
-# 3) GET /customer-insights/{customer_id} sends customer history to a Gemini model for analysis via Vertex AI.
+# 3) GET /customer-insights/{customer_id} calls Gemini via Vertex AI using an inline API key.
 
 import os
 import re
@@ -20,9 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sklearn.cluster import KMeans
 from google.cloud import storage  # For GCS
 
-# Use the unified Google Gen AI SDK (Vertex AI mode)
+# Unified Google Gen AI SDK (Vertex AI mode)
 from google import genai
-from google.genai import types
 
 # =========================
 # Logging
@@ -36,25 +36,23 @@ logger = logging.getLogger("customer-insights")
 # =========================
 # Config
 # =========================
-# CSV is loaded from Google Cloud Storage; set these in Cloud Run service.
+# GCS CSV location set via environment or defaults
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
 GCS_BLOB_NAME = os.getenv("GCS_BLOB_NAME")
 
-# Vertex AI API key and project/location
-API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-VERTEX_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT")
-VERTEX_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
+# Inline Vertex AI API key (for testing) with env override
+API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "AQ.Ab8RN6Js_U257WMEUfBO4rOK3gXLe0elpojCzXT5vnUb0uYxjQ"
 
-if not API_KEY:
-    logger.warning("GOOGLE_API_KEY/GEMINI_API_KEY not set; LLM calls will fail until configured.")
+# Project and location for Vertex AI
+VERTEX_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "sonic-name-471217-d8")
+VERTEX_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "europe-west1")
 
-# Initialize Google Gen AI SDK in Vertex mode (v1)
+# Initialize Google Gen AI SDK in Vertex mode
 client = genai.Client(
     vertexai=True,
     api_key=API_KEY,
     project=VERTEX_PROJECT,
     location=VERTEX_LOCATION,
-    http_options=types.HttpOptions(api_version="v1"),
 )
 
 MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash")
@@ -93,7 +91,7 @@ def resilient_read_csv(filepath_or_buffer: Union[str, Path, io.StringIO]) -> pd.
             return pd.read_csv(filepath_or_buffer, dtype=str, encoding=enc, engine="c", sep=",", low_memory=False)
         except Exception:
             if isinstance(filepath_or_buffer, io.StringIO):
-                filepath_or_buffer.seek(0)  # Reset buffer for next try
+                filepath_or_buffer.seek(0)
             pass
     for enc in encodings:
         try:
@@ -112,7 +110,6 @@ def load_df_from_gcs(bucket_name: str, blob_name: str) -> pd.DataFrame:
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
-
     logger.info("Downloading blob '%s' from bucket '%s'...", blob_name, bucket_name)
     data_string = blob.download_as_text()
     logger.info("Blob downloaded, parsing with resilient_read_csv.")
@@ -150,16 +147,13 @@ def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int
     date_col = date_cols[0] if date_cols else None
     if date_col:
         g = g.sort_values(by=[date_col]).reset_index(drop=True)
-
     keep_cols = [c for c in KEEP_COLS if c in g.columns]
     codebooks: Dict[str, Dict[str, str]] = {}
     cat_cols = [c for c in ["Item Description", "Material Group", "Distribution Channel", "Terms of Payment", "Document Currency"] if c in g.columns]
     for c in cat_cols:
         codebooks[c] = build_codebook(g[c])
-
     header = "COLUMNS|" + "|".join([sanitize_text(c) for c in keep_cols])
     code_header = "CODES|" + json.dumps(codebooks, separators=(",", ":"), ensure_ascii=False)
-
     data_lines = []
     for _, row in g.iterrows():
         fields = []
@@ -174,7 +168,6 @@ def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int
             else:
                 fields.append(sanitize_text(row.get(c)))
         data_lines.append("ROW|" + "|".join(fields))
-
     compact_text = "\n".join([header, code_header] + data_lines)
     return compact_text, len(data_lines)
 
@@ -186,20 +179,16 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
     g = cust_df.copy()
     date_cols = [c for c in ["Billing Date", "Created On"] if c in g.columns]
     date_col = date_cols[0] if date_cols else None
-
     if "Document Currency" in g.columns:
         cur_counts = g["Document Currency"].dropna().astype(str).value_counts()
         a["currency_mode"] = (cur_counts.index[0] if not cur_counts.empty else "")
     else:
         a["currency_mode"] = ""
-
     if "Net Value" in g.columns:
         g["Net Value"] = pd.to_numeric(g["Net Value"], errors="coerce")
     a["total_revenue_local"] = float(g["Net Value"].fillna(0).sum()) if "Net Value" in g.columns else 0.0
-
     revenue_by_year: Dict[str, float] = {}
     revenue_by_quarter: Dict[str, float] = {}
-
     if date_col:
         g[date_col] = pd.to_datetime(g[date_col], errors="coerce")
         g_valid = g[pd.notna(g[date_col])].copy()
@@ -208,26 +197,21 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
             revenue_by_year = {str(int(k)): float(v) for k, v in rev_series.fillna(0).to_dict().items()}
             q_series = g_valid.groupby(g_valid[date_col].dt.to_period("Q"))["Net Value"].sum(min_count=1)
             revenue_by_quarter = {quarter_key_from_period_str(str(k)): float(v) for k, v in q_series.fillna(0).to_dict().items()}
-
         dts = g_valid[date_col].sort_values().dropna().astype("datetime64[ns]")
         diffs = dts.diff().dt.days.dropna()
         a["median_days_between_orders"] = float(np.median(diffs)) if not diffs.empty else 0.0
     else:
         a["median_days_between_orders"] = 0.0
-
     a["revenue_by_year"] = revenue_by_year
     a["revenue_by_quarter"] = revenue_by_quarter
-
     item_col = None
     if "Item Description" in g.columns:
         item_col = "Item Description"
     elif "Material Group" in g.columns:
         item_col = "Material Group"
-
     a["top_materials_by_revenue"] = []
     a["price_stats"] = []
     a["top_copurchase_pairs"] = []
-
     if item_col and "Net Value" in g.columns:
         totals = g.groupby(item_col)["Net Value"].sum(min_count=1).fillna(0).sort_values(ascending=False)
         grand = float(totals.sum()) if not totals.empty else 0.0
@@ -237,7 +221,6 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
             pct = (float(val) / grand) if grand > 0 else 0.0
             top_materials.append({"material": str(mat), "revenue": float(val), "share": round(pct, 4)})
         a["top_materials_by_revenue"] = top_materials
-
         if "Net Price" in g.columns:
             price_stats = []
             for mat, sub in g.groupby(item_col):
@@ -254,13 +237,11 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
                 a["price_stats"] = price_stats_sorted[:20]
             else:
                 a["price_stats"] = price_stats[:20]
-
         date_key = None
         if "Billing Date" in g.columns and g["Billing Date"].notna().any():
             date_key = "Billing Date"
         elif "Created On" in g.columns and g["Created On"].notna().any():
             date_key = "Created On"
-
         pair_counts = Counter()
         if date_key:
             g[date_key] = pd.to_datetime(g[date_key], errors="coerce")
@@ -272,13 +253,11 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
                     pair_counts[(a_mat, b_mat)] += 1
         top_pairs = [{"a": a_m, "b": b_m, "count": int(c)} for (a_m, b_m), c in pair_counts.most_common(5)]
         a["top_copurchase_pairs"] = top_pairs
-
     a["total_records"] = int(len(g))
     if date_col and g[date_col].notna().any():
         a["distinct_days"] = int(g[date_col].dt.date.nunique())
     else:
         a["distinct_days"] = 0
-
     return a
 
 # =========================
@@ -310,18 +289,20 @@ if "Net Price" in raw_df.columns:
 
 raw_df[CUSTOMER_COL] = raw_df[CUSTOMER_COL].astype(str)
 
-logger.info("Non-null counts: Customer=%d, Net Value=%d, Created On=%d, Billing Date=%d",
-            raw_df[CUSTOMER_COL].notna().sum(),
-            raw_df[REVENUE_COL].notna().sum(),
-            raw_df["Created On"].notna().sum() if "Created On" in raw_df.columns else -1,
-            raw_df["Billing Date"].notna().sum() if "Billing Date" in raw_df.columns else -1)
+logger.info(
+    "Non-null counts: Customer=%d, Net Value=%d, Created On=%d, Billing Date=%d",
+    raw_df[CUSTOMER_COL].notna().sum(),
+    raw_df[REVENUE_COL].notna().sum(),
+    raw_df["Created On"].notna().sum() if "Created On" in raw_df.columns else -1,
+    raw_df["Billing Date"].notna().sum() if "Billing Date" in raw_df.columns else -1,
+)
 
 # Aggregate revenue per (company, customer)
 agg = (
     raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[REVENUE_COL]
-          .sum(min_count=1)
-          .reset_index()
-          .rename(columns={REVENUE_COL: "total_revenue"})
+    .sum(min_count=1)
+    .reset_index()
+    .rename(columns={REVENUE_COL: "total_revenue"})
 )
 agg["total_revenue"] = agg["total_revenue"].fillna(0.0).astype(float)
 
@@ -330,9 +311,9 @@ sales_doc_col = find_col(raw_df, SALES_DOC_CANDIDATES)
 if sales_doc_col and sales_doc_col in raw_df.columns:
     pf = (
         raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[sales_doc_col]
-              .nunique(dropna=True)
-              .reset_index()
-              .rename(columns={sales_doc_col: "purchasing_frequency"})
+        .nunique(dropna=True)
+        .reset_index()
+        .rename(columns={sales_doc_col: "purchasing_frequency"})
     )
 else:
     pf = agg[[company_col, CUSTOMER_COL]].copy()
@@ -343,7 +324,10 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     g["rev_pos"] = g["total_revenue"].clip(lower=0)
     if g["Customer"].nunique() < 3:
         ranks = g["rev_pos"].rank(method="first", ascending=False)
-        labels = np.where(ranks <= 1, "high_revenue", np.where(ranks <= 2, "mixed_revenue", "low_revenue"))
+        labels = np.where(
+            ranks <= 1, "high_revenue",
+            np.where(ranks <= 2, "mixed_revenue", "low_revenue")
+        )
         g["cluster_name"] = labels
         g["cluster_id"] = g["cluster_name"].map({"high_revenue": 0, "mixed_revenue": 1, "low_revenue": 2}).fillna(2).astype(int)
         return g.drop(columns=["rev_pos"])
@@ -363,13 +347,13 @@ clustered = pd.concat(clustered_list, ignore_index=True)
 
 clustered["revenue_rank_in_cluster"] = (
     clustered.groupby([company_col, "cluster_id"])["total_revenue"]
-             .rank(method="dense", ascending=False)
-             .astype(int)
+    .rank(method="dense", ascending=False)
+    .astype(int)
 )
 
 clustered = (
     clustered.merge(pf, on=[company_col, CUSTOMER_COL], how="left")
-             .rename(columns={company_col: "company_code", CUSTOMER_COL: "customer"})
+    .rename(columns={company_col: "company_code", CUSTOMER_COL: "customer"})
 )
 
 clustered_data = clustered[["company_code", "customer", "total_revenue", "cluster_name", "revenue_rank_in_cluster", "purchasing_frequency"]].copy()
@@ -483,17 +467,14 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
                     "discount": str(item.get("discount", "")),
                 })
         out["best_price_by_material"] = cleaned
-
     def trim_words(s: str, n: int) -> str:
         return " ".join(str(s).split()[:n])
-
     out["reason_churn_decision"] = trim_words(out["reason_churn_decision"], 20)
     out["how_to_retain"] = trim_words(out["how_to_retain"], 20)
     out["offers_we_can_provide"] = trim_words(out["offers_we_can_provide"], 20)
     out["details"] = trim_words(out["details"], 20)
     out["trend_of_buying"] = trim_words(out["trend_of_buying"], 40)
     out["product_combination"] = trim_words(out["product_combination"], 20)
-
     churn = out["churn"].strip().lower()
     out["churn"] = churn if churn in {"yes", "no"} else ""
     return out
@@ -525,11 +506,9 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     cust_df = raw_df[raw_df[CUSTOMER_COL].astype(str) == str(customer_id)]
     if cust_df.empty:
         raise HTTPException(status_code=404, detail="Customer not found")
-
     known_total_revenue = float(cust_df[REVENUE_COL].fillna(0).sum())
     aggregates_json = compute_aggregates_for_customer(cust_df)
     compact, nlines = full_transaction_block_for_customer(cust_df)
-
     row = clustered_data[clustered_data["customer"] == str(customer_id)].head(1).to_dict("records")
     ctx = row[0] if row else {}
     context_json = {
@@ -538,7 +517,6 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         "purchasing_frequency": int(ctx.get("purchasing_frequency", 0) or 0),
         "known_total_revenue_from_cluster": float(ctx.get("total_revenue", known_total_revenue)),
     }
-
     prompt = build_main_prompt(
         customer_id=customer_id,
         known_total_revenue=known_total_revenue,
@@ -546,9 +524,7 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         compact_block=compact,
         context_json=context_json,
     )
-
     logger.info("cust_rows=%d rev_sum=%.2f prompt_chars=%d", len(cust_df), known_total_revenue, len(prompt))
-
     raw_text = ""
     try:
         resp = client.models.generate_content(
@@ -561,18 +537,16 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     except Exception as e:
         logger.exception("LLM call failed: %s", e)
         parsed = None
-
     cluster_name = context_json.get("cluster_name", "")
     if isinstance(parsed, dict):
         coerced = coerce_to_schema_with_cluster(parsed, customer_id=customer_id, cluster_name=cluster_name)
         if debug:
             return {"result": coerced, "debug": {"raw_text_head": raw_text[:400], "parsed": True}}
         return coerced
-
     fallback = coerce_to_schema_with_cluster({}, customer_id=customer_id, cluster_name=cluster_name)
     if debug:
         return {"result": fallback, "debug": {"raw_text_head": raw_text[:400], "parsed": False}}
     return fallback
 
-# Example local run:
-# GCS_BUCKET_NAME="your-bucket" GCS_BLOB_NAME="llm_all_cust.csv" GOOGLE_API_KEY="vertex-api-key" uvicorn main:app --reload --port 8000
+# Local example:
+# GCS_BUCKET_NAME="your-bucket" GCS_BLOB_NAME="llm_all_cust.csv" uvicorn api_llm_cluster:app --reload --port 8000
