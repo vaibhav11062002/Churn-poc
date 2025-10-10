@@ -40,7 +40,7 @@ logger = logging.getLogger("customer-insights")
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
 GCS_BLOB_NAME = os.getenv("GCS_BLOB_NAME")
 
-# Inline Vertex AI API key (for testing) with env override
+# Inline Vertex AI API key (hardcoded for this deployment; override via env if present)
 API_KEY = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY") or "AQ.Ab8RN6Js_U257WMEUfBO4rOK3gXLe0elpojCzXT5vnUb0uYxjQ"
 
 # Project and location for Vertex AI
@@ -228,7 +228,7 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
                 if prices.empty:
                     continue
                 avg = float(prices.mean())
-                std = float(prices.std(ddof=0)) if len(prices) > 1 else 0.0
+                std = float(prices.std(ddof=0)) if len(prices > 1) else 0.0
                 cv = (std / avg) if avg > 0 else 0.0
                 price_stats.append({"material": str(mat), "avg_price": round(avg, 4), "cv": round(cv, 4)})
             if top_materials:
