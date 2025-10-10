@@ -42,7 +42,7 @@ API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 if not API_KEY:
     logger.warning("GEMINI_API_KEY/GOOGLE_API_KEY not set; LLM calls will fail until configured.")
 genai.configure(api_key=API_KEY)
-MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-flash") # Updated model name
+MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash") # Updated model name
 
 CUSTOMER_COL = "Customer"
 REVENUE_COL = "Net Value"
