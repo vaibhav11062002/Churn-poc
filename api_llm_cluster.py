@@ -12,6 +12,7 @@ from typing import Dict, Any, Tuple, List, Optional, Union
 from collections import Counter
 from itertools import combinations
 import io
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -578,14 +579,25 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     logger.info("cust_rows=%d rev_sum=%.2f prompt_chars=%d", len(cust_df), known_total_revenue, len(prompt))
 
     raw_text = ""
-    try:
-        resp = model.generate_content(prompt)
-        raw_text = (resp.text or "")
-        logger.info("LLM raw_text_len=%d", len(raw_text))
-        parsed = try_parse_json(raw_text)
-    except Exception as e:
-        logger.exception("LLM call failed: %s", e)
-        parsed = None
+    # REPLACE THE OLD BLOCK WITH THIS NEW DEBUGGING BLOCK
+try:
+    logger.info("Attempting to generate content with LLM...")
+    resp = model.generate_content(prompt)
+    raw_text = (resp.text or "")
+    logger.info("LLM raw_text_len=%d", len(raw_text))
+    parsed = try_parse_json(raw_text)
+
+    # If the LLM gives a response but it's not JSON, we should know
+    if not parsed and raw_text:
+        logger.error("LLM returned a non-JSON response: %s", raw_text[:500])
+        raise HTTPException(status_code=500, detail=f"LLM returned non-JSON response: {raw_text[:500]}")
+
+except Exception as e:
+    # THIS IS THE KEY CHANGE: We will return the full error as the API response
+    full_traceback = traceback.format_exc()
+    logger.error("LLM call failed with full traceback: %s", full_traceback)
+    # This will send the error back to your browser
+    raise HTTPException(status_code=500, detail=f"LLM_ERROR: {full_traceback}")
 
     cluster_name = context_json.get("cluster_name", "")
     if isinstance(parsed, dict):
