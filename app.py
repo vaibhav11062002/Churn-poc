@@ -1,10 +1,4 @@
 # app.py
-# FastAPI on Cloud Run with:
-# - CSV load from GCS
-# - Customer clustering
-# - Gemini LLM insights (service account OAuth2)
-# - Proper CORS for React frontend
-# - Detailed try/except logging
 
 import os
 import re
@@ -24,7 +18,7 @@ from google.oauth2 import service_account
 import google.generativeai as genai
 
 # =========================
-# Logging
+# Logging config
 # =========================
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -33,14 +27,18 @@ logging.basicConfig(
 logger = logging.getLogger("customer-insights")
 
 # =========================
-# Config (env)
+# Environment config
 # =========================
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
 GCS_BLOB_NAME = os.getenv("GCS_BLOB_NAME")
 
-# CORS: comma-separated origins, e.g. "http://localhost:3000,https://your-frontend.app"
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
-ALLOW_CREDENTIALS = os.getenv("ALLOW_CREDENTIALS", "false").lower() == "true"
+# CORS allowed origins including React dev and deployed frontend
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://chrun-ai.vercel.app"
+]
+ALLOW_CREDENTIALS = True
 
 MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
 
@@ -60,11 +58,11 @@ KEEP_COLS = [
 ]
 
 # =========================
-# LLM Auth via Service Account JSON in env
+# LLM Auth using Service Account JSON from env variable
 # =========================
 credentials_json_str = os.getenv("GEMINI_API_CREDENTIALS_JSON")
 if not credentials_json_str:
-    raise RuntimeError("GEMINI_API_CREDENTIALS_JSON environment variable is required for LLM auth")
+    raise RuntimeError("GEMINI_API_CREDENTIALS_JSON environment variable is required for LLM authentication")
 
 try:
     keyfile_dict = json.loads(credentials_json_str)
@@ -77,7 +75,7 @@ except Exception as e:
     raise
 
 # =========================
-# Helpers
+# Helper Functions
 # =========================
 def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols_lc = {c.lower(): c for c in df.columns}
@@ -251,9 +249,8 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
 
     return a
 
-# =========================
+
 # Prompt template (unchanged)
-# =========================
 PROMPT_TEMPLATE = """
 You are a data analyst. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
 
@@ -381,7 +378,7 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
     return out
 
 # =========================
-# GCS CSV load
+# Load CSV from GCS
 # =========================
 def load_df_from_gcs(bucket_name: str, blob_name: str) -> pd.DataFrame:
     try:
@@ -400,7 +397,7 @@ def load_df_from_gcs(bucket_name: str, blob_name: str) -> pd.DataFrame:
         raise
 
 # =========================
-# Cluster logic (3 clusters)
+# Clustering logic
 # =========================
 def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     g = g.copy()
@@ -424,7 +421,7 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     return g.drop(columns=["rev_pos", "km_id"])
 
 # =========================
-# Load data & cluster at startup
+# Load data and cluster at startup
 # =========================
 try:
     raw_df = load_df_from_gcs(GCS_BUCKET_NAME, GCS_BLOB_NAME)
@@ -453,11 +450,10 @@ try:
     raw_df[CUSTOMER_COL] = raw_df[CUSTOMER_COL].astype(str)
 
     logger.info("Non-null counts: Customer=%d, Net Value=%d, Created On=%d, Billing Date=%d",
-        raw_df[CUSTOMER_COL].notna().sum(),
-        raw_df[REVENUE_COL].notna().sum(),
-        raw_df["Created On"].notna().sum() if "Created On" in raw_df.columns else -1,
-        raw_df["Billing Date"].notna().sum() if "Billing Date" in raw_df.columns else -1
-    )
+                raw_df[CUSTOMER_COL].notna().sum(),
+                raw_df[REVENUE_COL].notna().sum(),
+                raw_df["Created On"].notna().sum() if "Created On" in raw_df.columns else -1,
+                raw_df["Billing Date"].notna().sum() if "Billing Date" in raw_df.columns else -1)
 
     agg = (
         raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[REVENUE_COL]
@@ -508,13 +504,13 @@ except Exception as e:
     clustered_data = pd.DataFrame()
 
 # =========================
-# FastAPI app + CORS
+# FastAPI app & CORS middleware
 # =========================
 app = FastAPI(title="Customer Clustering and Insights API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=origins,
     allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -534,22 +530,6 @@ async def health():
 async def get_clustered_data():
     logger.info("GET /clustered-data")
     return clustered_data.to_dict(orient="records")
-
-# =========================
-# LLM endpoint
-# =========================
-def build_main_prompt(customer_id: str,
-                      known_total_revenue: float,
-                      aggregates_json: Dict[str, Any],
-                      compact_block: str,
-                      context_json: Dict[str, Any]) -> str:
-    prompt = PROMPT_TEMPLATE
-    prompt = prompt.replace("[[CUSTOMER_ID]]", json.dumps(customer_id, ensure_ascii=False))
-    prompt = prompt.replace("[[KNOWN_TOTAL_REVENUE]]", str(round(float(known_total_revenue or 0.0), 4)))
-    prompt = prompt.replace("[[AGGREGATES_JSON]]", json.dumps(aggregates_json, separators=(",", ":"), ensure_ascii=False))
-    prompt = prompt.replace("[[CONTEXT_JSON]]", json.dumps(context_json, separators=(",", ":"), ensure_ascii=False))
-    prompt = prompt.replace("[[COMPACT_BLOCK]]", compact_block)
-    return prompt
 
 @app.get("/customer-insights/{customer_id}")
 async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
@@ -621,7 +601,6 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
                 }
             return coerced
 
-        # Fallback if parsing failed
         fallback = {
             "customer": customer_id,
             "cluster": cluster_name,
