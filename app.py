@@ -1,3 +1,11 @@
+# app.py
+# FastAPI on Cloud Run with:
+# - CSV load from GCS
+# - Customer clustering
+# - Gemini LLM insights (service account OAuth2)
+# - Proper CORS for React frontend
+# - Detailed try/except logging
+
 import os
 import re
 import json
@@ -5,6 +13,7 @@ import logging
 from typing import Dict, Any, Tuple, List, Optional
 from collections import Counter
 from itertools import combinations
+
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
@@ -24,34 +33,16 @@ logging.basicConfig(
 logger = logging.getLogger("customer-insights")
 
 # =========================
-# Config for GCS and OAuth2 credentials
+# Config (env)
 # =========================
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
 GCS_BLOB_NAME = os.getenv("GCS_BLOB_NAME")
 
-# Load Service Account JSON key from environment variable
-credentials_json_str = os.getenv("GEMINI_API_CREDENTIALS_JSON")
-if not credentials_json_str:
-    raise RuntimeError("GEMINI_API_CREDENTIALS_JSON environment variable is required")
-
-try:
-    keyfile_dict = json.loads(credentials_json_str)
-    credentials = service_account.Credentials.from_service_account_info(keyfile_dict)
-    logger.info("Loaded service account credentials successfully")
-except Exception as e:
-    logger.error(f"Failed to load service account credentials: {e}")
-    raise
-
-# Configure Google Generative AI client with OAuth2 credentials
-try:
-    genai.configure(credentials=credentials)
-    logger.info("Configured Google Generative AI client with OAuth2 credentials")
-except Exception as e:
-    logger.error(f"Failed to configure Google Generative AI client: {e}")
-    raise
+# CORS: comma-separated origins, e.g. "http://localhost:3000,https://your-frontend.app"
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
+ALLOW_CREDENTIALS = os.getenv("ALLOW_CREDENTIALS", "false").lower() == "true"
 
 MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
-model = genai.GenerativeModel(MODEL_NAME)
 
 CUSTOMER_COL = "Customer"
 REVENUE_COL = "Net Value"
@@ -69,7 +60,24 @@ KEEP_COLS = [
 ]
 
 # =========================
-# Helper functions
+# LLM Auth via Service Account JSON in env
+# =========================
+credentials_json_str = os.getenv("GEMINI_API_CREDENTIALS_JSON")
+if not credentials_json_str:
+    raise RuntimeError("GEMINI_API_CREDENTIALS_JSON environment variable is required for LLM auth")
+
+try:
+    keyfile_dict = json.loads(credentials_json_str)
+    credentials = service_account.Credentials.from_service_account_info(keyfile_dict)
+    genai.configure(credentials=credentials)
+    model = genai.GenerativeModel(MODEL_NAME)
+    logger.info("Configured Google Generative AI client with service account credentials")
+except Exception as e:
+    logger.exception("Failed to configure Generative AI client: %s", e)
+    raise
+
+# =========================
+# Helpers
 # =========================
 def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols_lc = {c.lower(): c for c in df.columns}
@@ -243,7 +251,9 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
 
     return a
 
-# Prompt template (from your local code)
+# =========================
+# Prompt template (unchanged)
+# =========================
 PROMPT_TEMPLATE = """
 You are a data analyst. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
 
@@ -371,7 +381,7 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
     return out
 
 # =========================
-# Load data from GCS with error handling
+# GCS CSV load
 # =========================
 def load_df_from_gcs(bucket_name: str, blob_name: str) -> pd.DataFrame:
     try:
@@ -380,13 +390,13 @@ def load_df_from_gcs(bucket_name: str, blob_name: str) -> pd.DataFrame:
         storage_client = storage.Client()
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(blob_name)
-        logger.info(f"Downloading CSV from GCS bucket {bucket_name} blob {blob_name}")
+        logger.info("Downloading CSV from GCS bucket %s blob %s", bucket_name, blob_name)
         data_string = blob.download_as_text()
         df = pd.read_csv(pd.io.common.StringIO(data_string), dtype=str)
-        logger.info(f"CSV loaded with shape {df.shape}")
+        logger.info("CSV loaded with shape=%s", df.shape)
         return df
     except Exception as e:
-        logger.error(f"Failed to download or parse CSV from GCS: {e}")
+        logger.exception("Failed to download or parse CSV from GCS: %s", e)
         raise
 
 # =========================
@@ -414,7 +424,7 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     return g.drop(columns=["rev_pos", "km_id"])
 
 # =========================
-# Load data and cluster at startup with logging
+# Load data & cluster at startup
 # =========================
 try:
     raw_df = load_df_from_gcs(GCS_BUCKET_NAME, GCS_BLOB_NAME)
@@ -451,9 +461,9 @@ try:
 
     agg = (
         raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[REVENUE_COL]
-            .sum(min_count=1)
-            .reset_index()
-            .rename(columns={REVENUE_COL: "total_revenue"})
+              .sum(min_count=1)
+              .reset_index()
+              .rename(columns={REVENUE_COL: "total_revenue"})
     )
     agg["total_revenue"] = agg["total_revenue"].fillna(0.0).astype(float)
 
@@ -461,51 +471,60 @@ try:
     if sales_doc_col and sales_doc_col in raw_df.columns:
         pf = (
             raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[sales_doc_col]
-                .nunique(dropna=True)
-                .reset_index()
-                .rename(columns={sales_doc_col: "purchasing_frequency"})
+                  .nunique(dropna=True)
+                  .reset_index()
+                  .rename(columns={sales_doc_col: "purchasing_frequency"})
         )
     else:
         pf = agg[[company_col, CUSTOMER_COL]].copy()
         pf["purchasing_frequency"] = 0
 
     clustered_list = []
-    for comp, g in agg.groupby(company_col, dropna=False):
+    for _, g in agg.groupby(company_col, dropna=False):
         clustered_list.append(cluster_one_company(g))
     clustered = pd.concat(clustered_list, ignore_index=True)
 
     clustered["revenue_rank_in_cluster"] = (
         clustered.groupby([company_col, "cluster_id"])["total_revenue"]
-            .rank(method="dense", ascending=False)
-            .astype(int)
+                 .rank(method="dense", ascending=False)
+                 .astype(int)
     )
 
     clustered = (
         clustered.merge(pf, on=[company_col, CUSTOMER_COL], how="left")
-                .rename(columns={company_col: "company_code", CUSTOMER_COL: "customer"})
+                 .rename(columns={company_col: "company_code", CUSTOMER_COL: "customer"})
     )
 
-    clustered_data = clustered[["company_code", "customer", "total_revenue", "cluster_name", "revenue_rank_in_cluster", "purchasing_frequency"]].copy()
+    clustered_data = clustered[[
+        "company_code", "customer", "total_revenue", "cluster_name",
+        "revenue_rank_in_cluster", "purchasing_frequency"
+    ]].copy()
 
     logger.info("clustered_data rows=%d, sample=%s", len(clustered_data), clustered_data.head(3).to_dict("records"))
 
 except Exception as e:
-    logger.error(f"Error during data load and clustering: {e}")
+    logger.exception("Error during data load and clustering: %s", e)
     raw_df = pd.DataFrame()
     clustered_data = pd.DataFrame()
 
 # =========================
-# FastAPI application and endpoints
+# FastAPI app + CORS
 # =========================
 app = FastAPI(title="Customer Clustering and Insights API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust for production environment
-    allow_credentials=True,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+    max_age=600,
 )
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
 
 @app.get("/health")
 async def health():
@@ -516,9 +535,25 @@ async def get_clustered_data():
     logger.info("GET /clustered-data")
     return clustered_data.to_dict(orient="records")
 
+# =========================
+# LLM endpoint
+# =========================
+def build_main_prompt(customer_id: str,
+                      known_total_revenue: float,
+                      aggregates_json: Dict[str, Any],
+                      compact_block: str,
+                      context_json: Dict[str, Any]) -> str:
+    prompt = PROMPT_TEMPLATE
+    prompt = prompt.replace("[[CUSTOMER_ID]]", json.dumps(customer_id, ensure_ascii=False))
+    prompt = prompt.replace("[[KNOWN_TOTAL_REVENUE]]", str(round(float(known_total_revenue or 0.0), 4)))
+    prompt = prompt.replace("[[AGGREGATES_JSON]]", json.dumps(aggregates_json, separators=(",", ":"), ensure_ascii=False))
+    prompt = prompt.replace("[[CONTEXT_JSON]]", json.dumps(context_json, separators=(",", ":"), ensure_ascii=False))
+    prompt = prompt.replace("[[COMPACT_BLOCK]]", compact_block)
+    return prompt
+
 @app.get("/customer-insights/{customer_id}")
 async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
-    logger.info(f"GET /customer-insights/{customer_id} debug={debug}")
+    logger.info("GET /customer-insights/%s debug=%s", customer_id, debug)
     try:
         cust_df = raw_df[raw_df[CUSTOMER_COL].astype(str) == str(customer_id)]
         if cust_df.empty:
@@ -550,18 +585,21 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
             context_json=context_json,
         )
 
-        logger.info(f"cust_rows={len(cust_df)} rev_sum={known_total_revenue:.2f} all_rows={nlines} created_nz={nonnull_created} billed_nz={nonnull_billed} items={n_items} prices={n_prices} prompt_chars={len(prompt)}")
+        logger.info(
+            "cust_rows=%d rev_sum=%.2f all_rows=%d created_nz=%d billed_nz=%d items=%d prices=%d prompt_chars=%d",
+            len(cust_df), known_total_revenue, nlines, nonnull_created, nonnull_billed, n_items, n_prices, len(prompt)
+        )
 
         raw_text = ""
         parsed = None
         try:
             resp = model.generate_content(prompt)
             raw_text = (resp.text or "")
-            logger.info(f"LLM raw_text_len={len(raw_text)}")
-            logger.debug(f"LLM raw_text_head={raw_text[:400].replace(chr(10), ' ')}")
+            logger.info("LLM raw_text_len=%d", len(raw_text))
+            logger.debug("LLM raw_text_head=%s", raw_text[:400].replace("\n", " "))
             parsed = try_parse_json(raw_text)
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
+            logger.error("LLM call failed: %s", e)
 
         cluster_name = context_json.get("cluster_name", "")
         if isinstance(parsed, dict):
@@ -583,6 +621,7 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
                 }
             return coerced
 
+        # Fallback if parsing failed
         fallback = {
             "customer": customer_id,
             "cluster": cluster_name,
@@ -619,5 +658,5 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Unexpected error in get_customer_insights for customer {customer_id}: {e}")
+        logger.exception("Unexpected error in get_customer_insights for customer %s: %s", customer_id, e)
         raise HTTPException(status_code=500, detail="Internal server error")
