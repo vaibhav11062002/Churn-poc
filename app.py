@@ -252,80 +252,90 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
 
 # Prompt template (unchanged)
 PROMPT_TEMPLATE = """
-You are a data analyst with access to competitive pricing intelligence. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
+You are a data analyst with access to an internal competitive pricing signal (market-low benchmark) for the customer's purchased products. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
 
 Task:
-- Produce high-ROI retention insights grounded in ordering cadence, value, price sensitivity, product mix, and full transaction trends.
-- Incorporate competitive pricing analysis for products ordered by the customer (where competitive products exist).
-- If a product has no market competitors, ignore competitive weighting and focus purely on transaction analysis.
+
+Produce high-ROI retention insights grounded in ordering cadence, value, price sensitivity, product mix, and full transaction trends.
+
+Make offers and price suggestions competitive with the low end of the market WITHOUT mentioning competitor names, sites, or exact competitor prices.
+
+If a product has no competing suppliers in the market, ignore competitive weighting entirely and base results only on transaction data.
 
 JSON schema to return:
 {
-  "customer": "<string>",
-  "cluster": "<string>",                // echo the provided context.cluster_name; do NOT infer
-  "churn": "yes|no", // predict after analyzing transaction trends + competitive positioning (if competitors exist)
-  "churn_analysis": "<max 20 words>", // consider both internal trends and competitive pressure (when applicable)
-  "retention_strategies": "<max 20 words>", // factor in competitive landscape (when competitors exist)
-  "Retention_offers": "<max 20 words>", // mention cheapest competitor and our advantage over them (if competitors exist)
-  "Purchase_details": "<materials bought frequently + revenue, max 20 words>",
-  "revenue_by_year": { "YYYY": number, "...": number },
-  "revenue_by_quarter": { "YYYY-QN": number, "...": number },
-  "trend_of_sales": "<max 40 words>",
-  "product_combination": "<max 20 words>",
-  "best_price_by_material": [ { "material": "<code or name>", "suggested_price": <number>, "discount": "<e.g. 5-10%>" } ],
-  "observation": "<min 75 words>", // include competitive context in analysis (when applicable)
-  "recommendation": "<min 75 words>" // integrate competitive positioning in strategy (when applicable)
+"customer": "<string>",
+"cluster": "<string>", // echo the provided context.cluster_name; do NOT infer
+"churn": "yes|no", // predict after analyzing transaction trends; include competition ONLY if competitors exist
+"churn_analysis": "<max 20 words>", // consider competition ONLY if competitors exist
+"retention_strategies": "<max 20 words>", // keep generic; avoid competitor names
+"Retention_offers": "<max 20 words>", // same style as earlier; craft offers that win vs market-low WITHOUT naming competitors
+"Purchase_details": "<materials bought frequently + revenue, max 20 words>",
+"revenue_by_year": { "YYYY": number, "...": number },
+"revenue_by_quarter": { "YYYY-QN": number, "...": number },
+"trend_of_sales": "<max 40 words>",
+"product_combination": "<max 20 words>",
+"best_price_by_material": [ { "material": "<code or name>", "suggested_price": <number>, "discount": "<e.g. 5-10%>" } ],
+"observation": "<min 75 words>",
+"recommendation": "<min 75 words>"
 }
 
-Competitive Pricing Context (apply only when competitors exist for customer's products):
-For products frequently ordered by this customer, assume the following competitive landscape:
-- BEV SYRUP: Sysco (15% cheaper), US Foods (8% cheaper), Performance Food Group (12% cheaper)
-- SAUCES: Sysco (10% cheaper), US Foods (5% cheaper), Gordon Food Service (7% cheaper) 
-- SYRUPS: US Foods (12% cheaper), Sysco (18% cheaper), Reinhart (9% cheaper)
-- TOPPINGS: Gordon Food Service (6% cheaper), US Foods (4% cheaper), Sysco (11% cheaper)
-- FILLINGS: Performance Food Group (13% cheaper), Sysco (8% cheaper), US Foods (10% cheaper)
-
-NOTE: If customer's primary products are NOT in the above competitive categories, treat as EXCLUSIVE products with no market competition and ignore competitive weighting entirely.
-
-Our Value Advantages (use when competitors exist):
-- Superior product quality and consistency
-- Faster delivery times and reliability
-- Better customer service and support
-- Comprehensive product portfolio
-- McDonald's certified supplier status
-- Volume discounts for large orders
-- Flexible payment terms
-- Technical support and consultation
-
 Inputs:
-- customer_id = [[CUSTOMER_ID]]
-- known_total_revenue = [[KNOWN_TOTAL_REVENUE]]  
-- aggregates_json = [[AGGREGATES_JSON]]
-- context = [[CONTEXT_JSON]]  // includes cluster_name, revenue_rank_in_cluster, purchasing_frequency
-- recent_history (FULL, all transactions for this customer; compacted):
-  - The first line begins with COLUMNS| and lists field order.
-  - The second line begins with CODES| and is a JSON map of categorical value→short code (unlisted→x0 as OTHER).
-  - Each subsequent line begins with ROW| and provides one transaction aligned to COLUMNS.
+
+customer_id = [[CUSTOMER_ID]]
+
+known_total_revenue = [[KNOWN_TOTAL_REVENUE]]
+
+aggregates_json = [[AGGREGATES_JSON]]
+
+context = [[CONTEXT_JSON]] // includes cluster_name, revenue_rank_in_cluster, purchasing_frequency
+
+recent_history (FULL, all transactions for this customer; compacted):
+
+The first line begins with COLUMNS| and lists field order.
+
+The second line begins with CODES| and is a JSON map of categorical value→short code (unlisted→x0 as OTHER).
+
+Each subsequent line begins with ROW| and provides one transaction aligned to COLUMNS.
 
 Recent history (compressed):
 [[COMPACT_BLOCK]]
 
-Analysis Rules:
-1) Primary analysis: Use aggregates_json for totals, cadence, top materials, price stats; recent_history for transaction details.
-2) Competitive context: 
-   - IF customer's primary products have market competitors → Factor competitive pricing (25% weight) + transaction analysis (75% weight)
-   - IF customer's primary products have NO market competitors → Use transaction analysis (100% weight), ignore competitive factors
-3) Price recommendations: suggested_price = avg_price from aggregates_json.price_stats; adjust discounts based on competitive pressure (if applicable).
-4) Retention offers: 
-   - WITH competitors: Identify cheapest competitor for customer's primary category and explain our advantage
-   - WITHOUT competitors: Focus on value-based retention (quality, service, relationship)
-5) Observation & recommendation: Integrate competitive landscape ONLY when competitors exist for customer's primary products.
-6) For unavailable data, use "" for strings, {} or [] for objects/arrays, and 0 for numbers.
-7) Output MUST be a single JSON object exactly per schema; no extra keys.
+Competitive signal and usage policy:
 
-Example Retention_offers responses:
-WITH COMPETITORS: "Match Sysco's BEV SYRUP price + superior McDonald's certification + faster delivery"
-WITHOUT COMPETITORS: "Exclusive product quality + volume discounts + dedicated account management"
+Market-low benchmark = an internal signal representing the lowest sustainable market price observed for a given material/category.
+
+Do NOT output vendor names, sites, or explicit competitor price points.
+
+If NO market-low benchmark exists for a product (no competing suppliers), treat it as exclusive and IGNORE competitive weighting.
+
+Analysis Rules:
+
+Primary analysis weight = 75% transaction trends (cadence, value, mix); competitive signal weight = 25% ONLY if market-low exists.
+
+best_price_by_material:
+
+Baseline: suggested_price = avg_price from aggregates_json.price_stats.
+
+If market-low benchmark exists for that material: suggested_price = min(avg_price, market_low_benchmark).
+
+discount: keep CV-based rule (CV≥0.15→"8-12%", 0.07–0.15→"5-8%", else→"3-5%"); if suggested_price > market_low_benchmark, choose the higher end of the bracket; if ≤ market_low_benchmark, choose the lower end.
+
+Retention_offers:
+
+Keep the same concise style as earlier (max 20 words).
+
+Must be competitive vs market-low (e.g., price-match/beat or add service/value), but do NOT include competitor names or websites and do NOT hardcode percentages.
+
+If no market-low exists: propose value-based retention (quality, reliability, service, payment flexibility) without referencing market.
+
+churn, churn_analysis, trend_of_sales, observation, recommendation:
+
+Integrate competitive pressure ONLY when market-low exists; otherwise rely solely on transaction data.
+
+Do NOT fabricate data; if something cannot be determined, leave it empty ("", {}, [], or 0 as appropriate).
+
+Output MUST be a single JSON object exactly per schema; no extra keys or sections.
 """.strip()
 
 def build_main_prompt(customer_id: str,
