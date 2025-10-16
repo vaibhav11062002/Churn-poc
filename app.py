@@ -252,32 +252,54 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
 
 # Prompt template (unchanged)
 PROMPT_TEMPLATE = """
-You are a data analyst. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
+You are a data analyst with access to competitive pricing intelligence. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
 
 Task:
 - Produce high-ROI retention insights grounded in ordering cadence, value, price sensitivity, product mix, and full transaction trends.
+- Incorporate competitive pricing analysis for products ordered by the customer (where competitive products exist).
+- If a product has no market competitors, ignore competitive weighting and focus purely on transaction analysis.
 
 JSON schema to return:
 {
   "customer": "<string>",
   "cluster": "<string>",                // echo the provided context.cluster_name; do NOT infer
-  "churn": "yes|no" "predict this after analysing the whole transaction trend not just revenue.",
-  "churn_analysis": "<max 20 words>" "predict this after analysing the whole transaction trend not just revenue and the quarterly revenue, also look for monthly revenue.",
-  "retention_strategies": "<max 20 words>" "predict this after analysing the whole transaction trend.",
-  "Retention_offers": "<max 20 words>" "predict this after analysing the whole transaction trend.",
+  "churn": "yes|no", // predict after analyzing transaction trends + competitive positioning (if competitors exist)
+  "churn_analysis": "<max 20 words>", // consider both internal trends and competitive pressure (when applicable)
+  "retention_strategies": "<max 20 words>", // factor in competitive landscape (when competitors exist)
+  "Retention_offers": "<max 20 words>", // mention cheapest competitor and our advantage over them (if competitors exist)
   "Purchase_details": "<materials bought frequently + revenue, max 20 words>",
   "revenue_by_year": { "YYYY": number, "...": number },
   "revenue_by_quarter": { "YYYY-QN": number, "...": number },
   "trend_of_sales": "<max 40 words>",
   "product_combination": "<max 20 words>",
   "best_price_by_material": [ { "material": "<code or name>", "suggested_price": <number>, "discount": "<e.g. 5-10%>" } ],
-  "observation": "<min 75 words>" "predict this after analysing the whole transaction trend.",
-  "recommendation": "<min 75 words>" "predict this after analysing the whole transaction trend."
+  "observation": "<min 75 words>", // include competitive context in analysis (when applicable)
+  "recommendation": "<min 75 words>" // integrate competitive positioning in strategy (when applicable)
 }
+
+Competitive Pricing Context (apply only when competitors exist for customer's products):
+For products frequently ordered by this customer, assume the following competitive landscape:
+- BEV SYRUP: Sysco (15% cheaper), US Foods (8% cheaper), Performance Food Group (12% cheaper)
+- SAUCES: Sysco (10% cheaper), US Foods (5% cheaper), Gordon Food Service (7% cheaper) 
+- SYRUPS: US Foods (12% cheaper), Sysco (18% cheaper), Reinhart (9% cheaper)
+- TOPPINGS: Gordon Food Service (6% cheaper), US Foods (4% cheaper), Sysco (11% cheaper)
+- FILLINGS: Performance Food Group (13% cheaper), Sysco (8% cheaper), US Foods (10% cheaper)
+
+NOTE: If customer's primary products are NOT in the above competitive categories, treat as EXCLUSIVE products with no market competition and ignore competitive weighting entirely.
+
+Our Value Advantages (use when competitors exist):
+- Superior product quality and consistency
+- Faster delivery times and reliability
+- Better customer service and support
+- Comprehensive product portfolio
+- McDonald's certified supplier status
+- Volume discounts for large orders
+- Flexible payment terms
+- Technical support and consultation
 
 Inputs:
 - customer_id = [[CUSTOMER_ID]]
-- known_total_revenue = [[KNOWN_TOTAL_REVENUE]]
+- known_total_revenue = [[KNOWN_TOTAL_REVENUE]]  
 - aggregates_json = [[AGGREGATES_JSON]]
 - context = [[CONTEXT_JSON]]  // includes cluster_name, revenue_rank_in_cluster, purchasing_frequency
 - recent_history (FULL, all transactions for this customer; compacted):
@@ -288,13 +310,22 @@ Inputs:
 Recent history (compressed):
 [[COMPACT_BLOCK]]
 
-Rules:
-1) Use aggregates_json for totals, cadence, top materials, price stats, and combinations; recent_history is for cross-checking details.
-2) For best_price_by_material: suggested_price = avg_price from aggregates_json.price_stats; discount: CV≥0.15→"8-12%", 0.07–0.15→"5-8%", else→"3-5%".
-3) trend_of_sales: capture patterns across months and quarters; avoid relying solely on a single quarter.
-4) observation and recommendation: each must be at least 75 words, business-specific and grounded in data.
-5) If any field cannot be determined, use "" for strings, {} or [] for objects/arrays, and 0 for numbers.
-6) Output MUST be a single JSON object exactly per schema; no extra keys.
+Analysis Rules:
+1) Primary analysis: Use aggregates_json for totals, cadence, top materials, price stats; recent_history for transaction details.
+2) Competitive context: 
+   - IF customer's primary products have market competitors → Factor competitive pricing (25% weight) + transaction analysis (75% weight)
+   - IF customer's primary products have NO market competitors → Use transaction analysis (100% weight), ignore competitive factors
+3) Price recommendations: suggested_price = avg_price from aggregates_json.price_stats; adjust discounts based on competitive pressure (if applicable).
+4) Retention offers: 
+   - WITH competitors: Identify cheapest competitor for customer's primary category and explain our advantage
+   - WITHOUT competitors: Focus on value-based retention (quality, service, relationship)
+5) Observation & recommendation: Integrate competitive landscape ONLY when competitors exist for customer's primary products.
+6) For unavailable data, use "" for strings, {} or [] for objects/arrays, and 0 for numbers.
+7) Output MUST be a single JSON object exactly per schema; no extra keys.
+
+Example Retention_offers responses:
+WITH COMPETITORS: "Match Sysco's BEV SYRUP price + superior McDonald's certification + faster delivery"
+WITHOUT COMPETITORS: "Exclusive product quality + volume discounts + dedicated account management"
 """.strip()
 
 def build_main_prompt(customer_id: str,
