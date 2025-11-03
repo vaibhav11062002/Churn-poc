@@ -1,12 +1,3 @@
-# app.py
-# FastAPI on Cloud Run with:
-# - CSV load from GCS
-# - Customer clustering
-# - Gemini LLM insights (service account OAuth2)
-# - Proper CORS for React frontend
-# - Detailed try/except logging
-
-import os
 import re
 import json
 import logging
@@ -16,33 +7,20 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
+import requests
+import io
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.cluster import KMeans
-from google.cloud import storage
-from google.oauth2 import service_account
 import google.generativeai as genai
 
 # =========================
-# Logging
+# Manual Config Variables
 # =========================
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-)
-logger = logging.getLogger("customer-insights")
-
-# =========================
-# Config (env)
-# =========================
-GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME")
-GCS_BLOB_NAME = os.getenv("GCS_BLOB_NAME")
-
-# CORS: comma-separated origins, e.g. "http://localhost:3000,https://your-frontend.app"
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
-ALLOW_CREDENTIALS = os.getenv("ALLOW_CREDENTIALS", "false").lower() == "true"
-
-MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+# SET THESE DIRECTLY
+CSV_URL = "https://raw.githubusercontent.com/vaibhav11062002/Churn-poc/main/llm_all_cust.csv"  # GitHub raw CSV URL
+GEMINI_API_KEY = "AIzaSyDDrwMUTp75A3Dc64auV-SHSv402mS1w4M"       # Replace with your Gemini API key
+MODEL_NAME = "gemini-2.5-flash"                   # Or any other Gemini model as needed
 
 CUSTOMER_COL = "Customer"
 REVENUE_COL = "Net Value"
@@ -59,25 +37,39 @@ KEEP_COLS = [
     "Order Quantity", "Net Price", "Net Value", "Document Currency"
 ]
 
+# CORS allowed origins including React dev and deployed frontend
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://chrun-ai.vercel.app"
+]
+ALLOW_CREDENTIALS = True
+
 # =========================
-# LLM Auth via Service Account JSON in env
+# Logging config
 # =========================
-credentials_json_str = os.getenv("GEMINI_API_CREDENTIALS_JSON")
-if not credentials_json_str:
-    raise RuntimeError("GEMINI_API_CREDENTIALS_JSON environment variable is required for LLM auth")
+logging.basicConfig(
+    level="INFO",
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+logger = logging.getLogger("customer-insights")
+
+# =========================
+# LLM Auth using API Key
+# =========================
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is required for LLM authentication")
 
 try:
-    keyfile_dict = json.loads(credentials_json_str)
-    credentials = service_account.Credentials.from_service_account_info(keyfile_dict)
-    genai.configure(credentials=credentials)
+    genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel(MODEL_NAME)
-    logger.info("Configured Google Generative AI client with service account credentials")
+    logger.info("Configured Google Generative AI client with API key")
 except Exception as e:
     logger.exception("Failed to configure Generative AI client: %s", e)
     raise
 
 # =========================
-# Helpers
+# Helper Functions
 # =========================
 def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols_lc = {c.lower(): c for c in df.columns}
@@ -245,42 +237,61 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
 
     a["total_records"] = int(len(g))
     if date_col and g[date_col].notna().any():
-        a["distinct_days"] = int(g[date_col].dt.date.nunique())
+        a["distinct_days"] = int(g[date_key].dt.date.nunique())
     else:
         a["distinct_days"] = 0
 
     return a
 
-# =========================
-# Prompt template (unchanged)
-# =========================
 PROMPT_TEMPLATE = """
-You are a data analyst. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
+You are a data analyst with access to competitive pricing intelligence. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
 
 Task:
 - Produce high-ROI retention insights grounded in ordering cadence, value, price sensitivity, product mix, and full transaction trends.
+- Incorporate competitive pricing analysis for products ordered by the customer (where competitive products exist).
+- If a product has no market competitors, ignore competitive weighting and focus purely on transaction analysis.
 
 JSON schema to return:
 {
   "customer": "<string>",
   "cluster": "<string>",                // echo the provided context.cluster_name; do NOT infer
-  "churn": "yes|no" "predict this after analysing the whole transaction trend not just revenue.",
-  "churn_analysis": "<max 20 words>" "predict this after analysing the whole transaction trend not just revenue and the quarterly revenue, also look for monthly revenue.",
-  "retention_strategies": "<max 20 words>" "predict this after analysing the whole transaction trend.",
-  "Retention_offers": "<max 20 words>" "predict this after analysing the whole transaction trend.",
+  "churn": "yes|no", // predict after analyzing transaction trends + competitive positioning (if competitors exist)
+  "churn_analysis": "<max 20 words>", // consider both internal trends and competitive pressure (when applicable)
+  "retention_strategies": "<max 20 words>", // factor in competitive landscape (when competitors exist)
+  "Retention_offers": "<max 20 words>", // mention cheapest competitor and our advantage over them (if competitors exist)
   "Purchase_details": "<materials bought frequently + revenue, max 20 words>",
   "revenue_by_year": { "YYYY": number, "...": number },
   "revenue_by_quarter": { "YYYY-QN": number, "...": number },
   "trend_of_sales": "<max 40 words>",
   "product_combination": "<max 20 words>",
   "best_price_by_material": [ { "material": "<code or name>", "suggested_price": <number>, "discount": "<e.g. 5-10%>" } ],
-  "observation": "<min 75 words>" "predict this after analysing the whole transaction trend.",
-  "recommendation": "<min 75 words>" "predict this after analysing the whole transaction trend."
+  "observation": "<min 75 words>", // include competitive context in analysis (when applicable)
+  "recommendation": "<min 75 words>" // integrate competitive positioning in strategy (when applicable)
 }
+
+Competitive Pricing Context (apply only when competitors exist for customer's products):
+For products frequently ordered by this customer, assume the following competitive landscape:
+- BEV SYRUP: Sysco (15% cheaper), US Foods (8% cheaper), Performance Food Group (12% cheaper)
+- SAUCES: Sysco (10% cheaper), US Foods (5% cheaper), Gordon Food Service (7% cheaper) 
+- SYRUPS: US Foods (12% cheaper), Sysco (18% cheaper), Reinhart (9% cheaper)
+- TOPPINGS: Gordon Food Service (6% cheaper), US Foods (4% cheaper), Sysco (11% cheaper)
+- FILLINGS: Performance Food Group (13% cheaper), Sysco (8% cheaper), US Foods (10% cheaper)
+
+NOTE: If customer's primary products are NOT in the above competitive categories, treat as EXCLUSIVE products with no market competition and ignore competitive weighting entirely.
+
+Our Value Advantages (use when competitors exist):
+- Superior product quality and consistency
+- Faster delivery times and reliability
+- Better customer service and support
+- Comprehensive product portfolio
+- McDonald's certified supplier status
+- Volume discounts for large orders
+- Flexible payment terms
+- Technical support and consultation
 
 Inputs:
 - customer_id = [[CUSTOMER_ID]]
-- known_total_revenue = [[KNOWN_TOTAL_REVENUE]]
+- known_total_revenue = [[KNOWN_TOTAL_REVENUE]]  
 - aggregates_json = [[AGGREGATES_JSON]]
 - context = [[CONTEXT_JSON]]  // includes cluster_name, revenue_rank_in_cluster, purchasing_frequency
 - recent_history (FULL, all transactions for this customer; compacted):
@@ -291,13 +302,19 @@ Inputs:
 Recent history (compressed):
 [[COMPACT_BLOCK]]
 
-Rules:
-1) Use aggregates_json for totals, cadence, top materials, price stats, and combinations; recent_history is for cross-checking details.
-2) For best_price_by_material: suggested_price = avg_price from aggregates_json.price_stats; discount: CV≥0.15→"8-12%", 0.07–0.15→"5-8%", else→"3-5%".
-3) trend_of_sales: capture patterns across months and quarters; avoid relying solely on a single quarter.
-4) observation and recommendation: each must be at least 75 words, business-specific and grounded in data.
-5) If any field cannot be determined, use "" for strings, {} or [] for objects/arrays, and 0 for numbers.
-6) Output MUST be a single JSON object exactly per schema; no extra keys.
+Analysis Rules:
+1) Primary analysis: Use aggregates_json for totals, cadence, top materials, price stats; recent_history for transaction details.
+2) Competitive context: 
+   - IF customer's primary products have market competitors → Factor competitive pricing (25% weight) + transaction analysis (75% weight)
+   - IF customer's primary products have NO market competitors → Use transaction analysis (100% weight), ignore competitive factors
+3) Price recommendations: suggested_price = avg_price from aggregates_json.price_stats; adjust discounts based on competitive pressure (if applicable).
+4) Retention offers: 
+   - WITH competitors: Identify cheapest competitor for customer's primary category and give offers to compete them with category as (quality, service, relationship).
+   - WITHOUT competitors: Focus on value-based retention (quality, service, relationship)
+5) Observation & recommendation: Integrate competitive landscape ONLY when competitors exist for customer's primary products.
+6) For unavailable data, use "" for strings, {} or [] for objects/arrays, and 0 for numbers.
+7) Output MUST be a single JSON object exactly per schema; no extra keys.
+
 """.strip()
 
 def build_main_prompt(customer_id: str,
@@ -381,26 +398,23 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
     return out
 
 # =========================
-# GCS CSV load
+# Load CSV from GitHub URL
 # =========================
-def load_df_from_gcs(bucket_name: str, blob_name: str) -> pd.DataFrame:
+def load_df_from_url(csv_url: str) -> pd.DataFrame:
     try:
-        if not bucket_name or not blob_name:
-            raise ValueError("GCS_BUCKET_NAME and GCS_BLOB_NAME must be set")
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        logger.info("Downloading CSV from GCS bucket %s blob %s", bucket_name, blob_name)
-        data_string = blob.download_as_text()
-        df = pd.read_csv(pd.io.common.StringIO(data_string), dtype=str)
+        logger.info("Downloading CSV from URL %s", csv_url)
+        response = requests.get(csv_url)
+        response.raise_for_status()
+        data_string = response.text
+        df = pd.read_csv(io.StringIO(data_string), dtype=str)
         logger.info("CSV loaded with shape=%s", df.shape)
         return df
     except Exception as e:
-        logger.exception("Failed to download or parse CSV from GCS: %s", e)
+        logger.exception("Failed to download or parse CSV from URL: %s", e)
         raise
 
 # =========================
-# Cluster logic (3 clusters)
+# Clustering logic
 # =========================
 def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     g = g.copy()
@@ -424,10 +438,10 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     return g.drop(columns=["rev_pos", "km_id"])
 
 # =========================
-# Load data & cluster at startup
+# Load data and cluster at startup
 # =========================
 try:
-    raw_df = load_df_from_gcs(GCS_BUCKET_NAME, GCS_BLOB_NAME)
+    raw_df = load_df_from_url(CSV_URL)
 
     for col in ["Created On", "Billing Date"]:
         if col in raw_df.columns:
@@ -453,11 +467,10 @@ try:
     raw_df[CUSTOMER_COL] = raw_df[CUSTOMER_COL].astype(str)
 
     logger.info("Non-null counts: Customer=%d, Net Value=%d, Created On=%d, Billing Date=%d",
-        raw_df[CUSTOMER_COL].notna().sum(),
-        raw_df[REVENUE_COL].notna().sum(),
-        raw_df["Created On"].notna().sum() if "Created On" in raw_df.columns else -1,
-        raw_df["Billing Date"].notna().sum() if "Billing Date" in raw_df.columns else -1
-    )
+                raw_df[CUSTOMER_COL].notna().sum(),
+                raw_df[REVENUE_COL].notna().sum(),
+                raw_df["Created On"].notna().sum() if "Created On" in raw_df.columns else -1,
+                raw_df["Billing Date"].notna().sum() if "Billing Date" in raw_df.columns else -1)
 
     agg = (
         raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[REVENUE_COL]
@@ -508,13 +521,13 @@ except Exception as e:
     clustered_data = pd.DataFrame()
 
 # =========================
-# FastAPI app + CORS
+# FastAPI app & CORS middleware
 # =========================
 app = FastAPI(title="Customer Clustering and Insights API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=origins,
     allow_credentials=ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -534,22 +547,6 @@ async def health():
 async def get_clustered_data():
     logger.info("GET /clustered-data")
     return clustered_data.to_dict(orient="records")
-
-# =========================
-# LLM endpoint
-# =========================
-def build_main_prompt(customer_id: str,
-                      known_total_revenue: float,
-                      aggregates_json: Dict[str, Any],
-                      compact_block: str,
-                      context_json: Dict[str, Any]) -> str:
-    prompt = PROMPT_TEMPLATE
-    prompt = prompt.replace("[[CUSTOMER_ID]]", json.dumps(customer_id, ensure_ascii=False))
-    prompt = prompt.replace("[[KNOWN_TOTAL_REVENUE]]", str(round(float(known_total_revenue or 0.0), 4)))
-    prompt = prompt.replace("[[AGGREGATES_JSON]]", json.dumps(aggregates_json, separators=(",", ":"), ensure_ascii=False))
-    prompt = prompt.replace("[[CONTEXT_JSON]]", json.dumps(context_json, separators=(",", ":"), ensure_ascii=False))
-    prompt = prompt.replace("[[COMPACT_BLOCK]]", compact_block)
-    return prompt
 
 @app.get("/customer-insights/{customer_id}")
 async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
@@ -621,7 +618,6 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
                 }
             return coerced
 
-        # Fallback if parsing failed
         fallback = {
             "customer": customer_id,
             "cluster": cluster_name,
