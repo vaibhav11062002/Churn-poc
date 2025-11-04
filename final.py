@@ -279,14 +279,6 @@ For products frequently ordered by this customer, assume the following competiti
 
 NOTE: If customer's primary products are NOT in the above competitive categories, treat as EXCLUSIVE products with no market competition and ignore competitive weighting entirely.
 
-Our Value Advantages (use when competitors exist):
-- Superior product quality and consistency
-- Faster delivery times and reliability
-- Better customer service and support
-- Comprehensive product portfolio
-- Volume discounts for large orders
-- Flexible payment terms
-- Technical support and consultation
 
 Inputs:
 - customer_id = [[CUSTOMER_ID]]
