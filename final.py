@@ -284,7 +284,6 @@ Our Value Advantages (use when competitors exist):
 - Faster delivery times and reliability
 - Better customer service and support
 - Comprehensive product portfolio
-- McDonald's certified supplier status
 - Volume discounts for large orders
 - Flexible payment terms
 - Technical support and consultation
