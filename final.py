@@ -244,68 +244,107 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
     return a
 
 PROMPT_TEMPLATE = """
-You are a data analyst with access to competitive pricing intelligence. Return ONLY a single JSON object matching the schema below (no markdown, no code blocks, no extra keys).
+
+Your role is to speak the language of account management, sales leadership, and P&L accountability—not data science.
 
 Task:
-- Produce high-ROI retention insights grounded in ordering cadence, value, price sensitivity, product mix, and full transaction trends.
-- Incorporate competitive pricing analysis for products ordered by the customer (where competitive products exist).
-- If a product has no market competitors, ignore competitive weighting and focus purely on transaction analysis.
+
+Deliver actionable retention insights centered on account profitability, purchase cadence, customer value, competitive pricing pressure, and product portfolio balance.
+
+Use a commercial lens to assess risk and recommend revenue protection or growth actions.
+
+When competitive products are present, blend internal transaction performance with competitive pricing insights to guide offer structure and positioning.
+
+When no competition exists for purchased items, base the analysis purely on internal transaction dynamics and customer value trends.
 
 JSON schema to return:
 {
-  "customer": "<string>",
-  "cluster": "<string>",                // echo the provided context.cluster_name; do NOT infer
-  "churn": "yes|no", // predict after analyzing transaction trends + competitive positioning (if competitors exist)
-  "churn_analysis": "<max 20 words>", // consider both internal trends and competitive pressure (when applicable)
-  "retention_strategies": "<max 20 words>", // factor in competitive landscape (when competitors exist)
-  "Retention_offers": "<max 20 words>", // mention cheapest competitor and our advantage over them (if competitors exist)
-  "Purchase_details": "<materials bought frequently + revenue, max 20 words>",
-  "revenue_by_year": { "YYYY": number, "...": number },
-  "revenue_by_quarter": { "YYYY-QN": number, "...": number },
-  "trend_of_sales": "<max 40 words>",
-  "product_combination": "<max 20 words>",
-  "best_price_by_material": [ { "material": "<code or name>", "suggested_price": <number>, "discount": "<e.g. 5-10%>" } ],
-  "observation": "<min 75 words>", // include competitive context in analysis (when applicable)
-  "recommendation": "<min 75 words>" // integrate competitive positioning in strategy (when applicable)
+"customer": "<string>",
+"cluster": "<string>",
+"churn": "yes|no",
+"churn_analysis": "<max 20 words>",
+"retention_strategies": "<max 20 words>",
+"Retention_offers": "<max 20 words>",
+"Purchase_details": "<materials bought frequently + revenue, max 20 words>",
+"revenue_by_year": { "YYYY": number, "...": number },
+"revenue_by_quarter": { "YYYY-QN": number, "...": number },
+"trend_of_sales": "<max 40 words>",
+"product_combination": "<max 20 words>",
+"best_price_by_material": [ { "material": "<code or name>", "suggested_price": <number>, "discount": "<e.g. 5-10%>" } ],
+"observation": "<min 75 words>",
+"recommendation": "<min 75 words>"
 }
 
+Tone and Style Requirements:
+
+Use clear, commercially actionable language—avoid technical or analytical jargon.
+
+Emphasize account growth, profit protection, and competitive advantage.
+
+Frame all commentary as if speaking to sales and regional leadership teams responsible for revenue delivery.
+
+"observation" and "recommendation" must be written as concise bullet-style action insights with a business lens, not paragraphs.
+
+Each bullet point should reflect tactical or strategic actions tied to account health, margin preservation, or share-of-wallet defense.
+
 Competitive Pricing Context (apply only when competitors exist for customer's products):
-For products frequently ordered by this customer, assume the following competitive landscape:
-- BEV SYRUP: Sysco (15% cheaper), US Foods (8% cheaper), Performance Food Group (12% cheaper)
-- SAUCES: Sysco (10% cheaper), US Foods (5% cheaper), Gordon Food Service (7% cheaper) 
-- SYRUPS: US Foods (12% cheaper), Sysco (18% cheaper), Reinhart (9% cheaper)
-- TOPPINGS: Gordon Food Service (6% cheaper), US Foods (4% cheaper), Sysco (11% cheaper)
-- FILLINGS: Performance Food Group (13% cheaper), Sysco (8% cheaper), US Foods (10% cheaper)
 
-NOTE: If customer's primary products are NOT in the above competitive categories, treat as EXCLUSIVE products with no market competition and ignore competitive weighting entirely.
+BEV SYRUP: Sysco (15% cheaper), US Foods (8% cheaper), Performance Food Group (12% cheaper)
 
+SAUCES: Sysco (10% cheaper), US Foods (5% cheaper), Gordon Food Service (7% cheaper)
+
+SYRUPS: US Foods (12% cheaper), Sysco (18% cheaper), Reinhart (9% cheaper)
+
+TOPPINGS: Gordon Food Service (6% cheaper), US Foods (4% cheaper), Sysco (11% cheaper)
+
+FILLINGS: Performance Food Group (13% cheaper), Sysco (8% cheaper), US Foods (10% cheaper)
+
+NOTE: If customer's primary products are NOT in the above competitive categories, treat as EXCLUSIVE products with no market competition and ignore competitive factors.
 
 Inputs:
-- customer_id = [[CUSTOMER_ID]]
-- known_total_revenue = [[KNOWN_TOTAL_REVENUE]]  
-- aggregates_json = [[AGGREGATES_JSON]]
-- context = [[CONTEXT_JSON]]  // includes cluster_name, revenue_rank_in_cluster, purchasing_frequency
-- recent_history (FULL, all transactions for this customer; compacted):
-  - The first line begins with COLUMNS| and lists field order.
-  - The second line begins with CODES| and is a JSON map of categorical value→short code (unlisted→x0 as OTHER).
-  - Each subsequent line begins with ROW| and provides one transaction aligned to COLUMNS.
+
+customer_id = [[CUSTOMER_ID]]
+
+known_total_revenue = [[KNOWN_TOTAL_REVENUE]]
+
+aggregates_json = [[AGGREGATES_JSON]]
+
+context = [[CONTEXT_JSON]]
+
+recent_history (FULL, all transactions for this customer; compacted):
+
+The first line begins with COLUMNS| and lists field order.
+
+The second line begins with CODES| and is a JSON map of categorical value→short code (unlisted→x0 as OTHER).
+
+Each subsequent line begins with ROW| and provides one transaction aligned to COLUMNS.
 
 Recent history (compressed):
 [[COMPACT_BLOCK]]
 
 Analysis Rules:
-1) Primary analysis: Use aggregates_json for totals, cadence, top materials, price stats; recent_history for transaction details.
-2) Competitive context: 
-   - IF customer's primary products have market competitors → Factor competitive pricing (25% weight) + transaction analysis (75% weight)
-   - IF customer's primary products have NO market competitors → Use transaction analysis (100% weight), ignore competitive factors
-3) Price recommendations: suggested_price = avg_price from aggregates_json.price_stats; adjust discounts based on competitive pressure (if applicable).
-4) Retention offers: 
-   - WITH competitors: Identify cheapest competitor for customer's primary category and give offers to compete them with category as (quality, service, relationship).
-   - WITHOUT competitors: Focus on value-based retention (quality, service, relationship)
-5) Observation & recommendation: Integrate competitive landscape ONLY when competitors exist for customer's primary products.
-6) For unavailable data, use "" for strings, {} or [] for objects/arrays, and 0 for numbers.
-7) Output MUST be a single JSON object exactly per schema; no extra keys.
 
+Use aggregates_json for totals, cadence, top materials, and value patterns.
+
+Combine transaction flow, pricing pressure, and buyer consistency to assess churn likelihood.
+
+Apply competitive weighting:
+
+Products with competitors → 25% weight to price gap and 75% to account behavior.
+
+Exclusive products → transaction & value performance only.
+
+Price recommendations = average realized price adjusted for margin sustainability and competitive gap.
+
+Retention offers → clearly state value proposition versus competitors (price, reliability, supply, service).
+
+Observations → list 4–5 concise business insights as bullet points about customer behavior, trends, or risks.
+
+Recommendations → list 4–5 actionable commercial levers (e.g., pricing move, bundle opportunity, cross-sell, relationship action).
+
+For unavailable data, use "" for strings, {} or [] for objects/arrays, and 0 for numbers.
+
+Output MUST be a single JSON object exactly per schema; no extra keys.
 """.strip()
 
 def build_main_prompt(customer_id: str,
