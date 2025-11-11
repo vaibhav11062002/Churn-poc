@@ -399,7 +399,7 @@ Retention offers → clearly state value proposition versus competitors (price, 
 
 Observations → list 4–5 concise business insights as bullet points about customer behavior, trends, or risks.
 
-Recommendations → list 4–5 actionable commercial levers (e.g., pricing move, bundle opportunity, cross-sell, relationship action).
+Recommendations → list 4–5 actionable commercial levers (e.g., pricing move, bundle opportunity, cross-sell, relationship action). Also in Recommendations one key value pair should always be about ROI for next quater is the suggested changes are done.
 
 For unavailable data, use "" for strings, {} or [] for objects/arrays, and 0 for numbers.
 
