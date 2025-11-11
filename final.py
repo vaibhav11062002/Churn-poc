@@ -1,4 +1,5 @@
 import re
+import ast
 import json
 import logging
 from typing import Dict, Any, Tuple, List, Optional
@@ -217,6 +218,26 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
             else:
                 a["price_stats"] = price_stats[:20]
 
+        # Build a map of material -> avg_price from price_stats (average 'current' prices)
+        price_stats_map = {p["material"]: p["avg_price"] for p in a.get("price_stats", [])}
+
+        # Update best_price_by_material entries to add "current_price"
+        best_price_materials = []
+        for entry in a.get("best_price_by_material", []):
+            material = entry.get("material", "")
+            suggested_price = entry.get("suggested_price", 0.0)
+            discount = entry.get("discount", "")
+            current_price = price_stats_map.get(material, 0.0)
+            best_price_materials.append({
+                "material": material,
+                "current_price": round(current_price, 4),
+                "suggested_price": suggested_price,
+                "discount": discount,
+            })
+
+        a["best_price_by_material"] = best_price_materials
+
+
         date_key = None
         if "Billing Date" in g.columns and g["Billing Date"].notna().any():
             date_key = "Billing Date"
@@ -242,6 +263,38 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
         a["distinct_days"] = 0
 
     return a
+
+def parse_insights_to_kv_list(text: str) -> List[Dict[str, str]]:
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    kv_list = []
+    for line in lines:
+        if ":" in line:
+            key, value = line.split(":", 1)
+        elif "-" in line:
+            key, value = line.split("-", 1)
+        elif "," in line:
+            key, value = line.split(",", 1)
+        else:
+            parts = line.split()
+            key = " ".join(parts[:2])
+            value = " ".join(parts[2:]) if len(parts) > 2 else ""
+        kv_list.append({"key": key.strip(), "value": value.strip()})
+    return kv_list
+
+def parse_nested_json_list_field(field_value):
+    """
+    If field_value is a string that looks like a list of dicts, convert it to actual list.
+    Else, return as-is.
+    """
+    if isinstance(field_value, str):
+        try:
+            # Use literal_eval to safely evaluate string to python list/dict
+            val = ast.literal_eval(field_value)
+            if isinstance(val, list):
+                return val
+        except Exception:
+            pass
+    return field_value
 
 PROMPT_TEMPLATE = """
 
@@ -270,9 +323,13 @@ JSON schema to return:
 "revenue_by_quarter": { "YYYY-QN": number, "...": number },
 "trend_of_sales": "<max 40 words>",
 "product_combination": "<max 20 words>",
-"best_price_by_material": [ { "material": "<code or name>", "suggested_price": <number>, "discount": "<e.g. 5-10%>" } ],
-"observation": "<min 75 words>",
-"recommendation": "<min 75 words>"
+"best_price_by_material": [ { "material": "<code or name>", "current_price": <number>, "suggested_price": <number>, "discount": "<e.g. 5-10%>" } ],
+"observation": [
+  {"key": "<concise insight title>", "value": "<actionable business insight>"}
+],
+"recommendation": [
+  {"key": "<action title>", "value": "<specific sales/retention recommendation>"}
+]
 }
 
 Tone and Style Requirements:
@@ -284,6 +341,8 @@ Emphasize account growth, profit protection, and competitive advantage.
 Frame all commentary as if speaking to sales and regional leadership teams responsible for revenue delivery.
 
 "observation" and "recommendation" must be written as concise bullet-style action insights with a business lens, not paragraphs.
+
+For "observation" and "recommendation", return JSON arrays where each item is an object with "key" and "value", representing bullet-point insights and recommendations in clear business terms.
 
 Each bullet point should reflect tactical or strategic actions tied to account health, margin preservation, or share-of-wallet defense.
 
@@ -409,6 +468,7 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
                 continue
             cleaned.append({
                 "material": str(item.get("material", "")),
+                "current_price": float(item.get("current_price", 0) or 0),
                 "suggested_price": float(item.get("suggested_price", 0) or 0),
                 "discount": str(item.get("discount", "")),
             })
@@ -631,6 +691,12 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         cluster_name = context_json.get("cluster_name", "")
         if isinstance(parsed, dict):
             coerced = coerce_to_schema_with_cluster(parsed, customer_id=customer_id, cluster_name=cluster_name)
+
+                # Parse observation and recommendation strings into key-value lists
+            coerced["observation"] = parse_nested_json_list_field(coerced.get("observation", ""))
+            coerced["recommendation"] = parse_nested_json_list_field(coerced.get("recommendation", ""))
+
+
             if debug:
                 return {
                     "result": coerced,
@@ -647,6 +713,7 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
                     },
                 }
             return coerced
+
 
         fallback = {
             "customer": customer_id,
