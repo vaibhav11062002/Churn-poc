@@ -20,7 +20,7 @@ import google.generativeai as genai
 # =========================
 # SET THESE DIRECTLY
 CSV_URL = "https://raw.githubusercontent.com/vaibhav11062002/Churn-poc/main/llm_all_cust.csv"  # GitHub raw CSV URL
-GEMINI_API_KEY = "AIzaSyAyr2sLxZNrIpPj0f1-3ytTfZhv7T8FlUg"       # Replace with your Gemini API key
+GEMINI_API_KEY = "AIzaSyAsaqUkDY7IuFc12P9a7jBmJER9i2ft3BE"       # Replace with your Gemini API key
 MODEL_NAME = "gemini-2.5-flash"                   # Or any other Gemini model as needed
 
 CUSTOMER_COL = "Customer"
