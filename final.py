@@ -522,7 +522,7 @@ def load_df_from_hana():
 def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     g = g.copy()
     g["rev_pos"] = g["total_revenue"].clip(lower=0)
-    if g["SoldToParty"].nunique() < 3:
+    if g[CUSTOMER_COL].nunique() < 3:
         ranks = g["rev_pos"].rank(method="first", ascending=False)
         labels = np.where(
             ranks <= 1, "high_revenue",
@@ -608,11 +608,11 @@ try:
 
     clustered = (
         clustered.merge(pf, on=[company_col, CUSTOMER_COL], how="left")
-                 .rename(columns={company_col: "BillingCompanyCode", CUSTOMER_COL: "SoldToParty"})
+                 .rename(columns={company_col: "company_code", CUSTOMER_COL: "customer"})
     )
 
     clustered_data = clustered[[
-        "BillingCompanyCode", "SoldToParty", "total_revenue", "cluster_name",
+        "company_code", "customer", "total_revenue", "cluster_name",
         "revenue_rank_in_cluster", "purchasing_frequency"
     ]].copy()
 
@@ -668,7 +668,7 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         aggregates_json = compute_aggregates_for_customer(cust_df)
         compact, nlines = full_transaction_block_for_customer(cust_df)
 
-        row = clustered_data[clustered_data["SoldToParty"] == str(customer_id)].head(1).to_dict("records")
+        row = clustered_data[clustered_data["customer"] == str(customer_id)].head(1).to_dict("records")
         ctx = row[0] if row else {}
         context_json = {
             "cluster_name": ctx.get("cluster_name", ""),
