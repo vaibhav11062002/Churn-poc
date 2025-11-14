@@ -2,13 +2,13 @@ import re
 import ast
 import json
 import logging
+from hdbcli import dbapi
 from typing import Dict, Any, Tuple, List, Optional
 from collections import Counter
 from itertools import combinations
 
 import numpy as np
 import pandas as pd
-import requests
 import io
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,24 +18,30 @@ import google.generativeai as genai
 # =========================
 # Manual Config Variables
 # =========================
-# SET THESE DIRECTLY
-CSV_URL = "https://raw.githubusercontent.com/vaibhav11062002/Churn-poc/main/llm_all_cust.csv"  # GitHub raw CSV URL
-GEMINI_API_KEY = "AIzaSyAsaqUkDY7IuFc12P9a7jBmJER9i2ft3BE"       # Replace with your Gemini API key
-MODEL_NAME = "gemini-2.5-flash"                   # Or any other Gemini model as needed
+# SAP HANA Connection Parameters
+GEMINI_API_KEY = "AIzaSyAsaqUkDY7IuFc12P9a7jBmJER9i2ft3BE"
+MODEL_NAME = "gemini-2.5-flash"
 
-CUSTOMER_COL = "Customer"
-REVENUE_COL = "Net Value"
+dbuser = "DSP_CUST_CONTENT#DSP_CUST_CONTENT"
+dbpassword = "g6D,$a%@D`3$!)-GaVO#_[]T+=3z~[Z6"
+dbhost = "c0c94ed5-bef0-4ca4-95f8-55cf5a4ecbdc.hana.prod-us10.hanacloud.ondemand.com"
+dbport = 443
+dbschema = "DSP_CUST_CONTENT"
+viewname = "SALES_ORDER_CUST_SEGMENTATION"
+
+CUSTOMER_COL = "SoldToParty"
+REVENUE_COL = "NetAmount"
 COMPANY_COL_CANDIDATES = [
-    "Company Code", "company code", "company_code", "ccode to be billed", "c_code", "ccode"
+    "Company Code", "company code", "company_code", "ccode to be billed", "c_code", "ccode", "BillingCompanyCode"
 ]
 SALES_DOC_CANDIDATES = [
-    "Sales Document", "Sales Document Number", "Billing Document", "Billing Doc",
+    "SalesDocument", "Sales Document Number", "Billing Document", "Billing Doc",
     "Invoice Number", "Invoice", "Document Number"
 ]
 KEEP_COLS = [
-    "Billing Date", "Created On", "Item Description",
-    "Material Group", "Distribution Channel", "Terms of Payment",
-    "Order Quantity", "Net Price", "Net Value", "Document Currency"
+    "BillingDocumentDate", "CreationDate", "Item_Description",
+    "ProductGroup", "DistributionChannel", 
+    "OrderQuantity", "NetPriceAmount", "NetAmount", "TransactionCurrency"
 ]
 
 # CORS allowed origins including React dev and deployed frontend
@@ -109,14 +115,14 @@ def build_codebook(series: pd.Series) -> Dict[str, str]:
 
 def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int]:
     g = cust_df.copy()
-    date_cols = [c for c in ["Billing Date", "Created On"] if c in g.columns]
+    date_cols = [c for c in ["BillingDocumentDate", "CreationDate"] if c in g.columns]
     date_col = date_cols[0] if date_cols else None
     if date_col:
         g = g.sort_values(by=[date_col]).reset_index(drop=True)
 
     keep_cols = [c for c in KEEP_COLS if c in g.columns]
     codebooks: Dict[str, Dict[str, str]] = {}
-    cat_cols = [c for c in ["Item Description", "Material Group", "Distribution Channel", "Terms of Payment", "Document Currency"] if c in g.columns]
+    cat_cols = [c for c in ["Item_Description", "ProductGroup", "DistributionChannel", "TransactionCurrency"] if c in g.columns]
     for c in cat_cols:
         codebooks[c] = build_codebook(g[c])
 
@@ -127,11 +133,11 @@ def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int
     for _, row in g.iterrows():
         fields = []
         for c in keep_cols:
-            if c in ["Billing Date", "Created On"]:
+            if c in ["BillingDocumentDate", "CreationDate"]:
                 fields.append(norm_date(row.get(c)))
-            elif c in ["Order Quantity", "Net Price", "Net Value"]:
+            elif c in ["OrderQuantity", "NetPriceAmount", "NetAmount"]:
                 fields.append(norm_num(row.get(c)))
-            elif c in ["Item Description", "Material Group", "Distribution Channel", "Terms of Payment", "Document Currency"]:
+            elif c in ["Item_Description", "ProductGroup", "DistributionChannel", "TransactionCurrency"]:
                 raw = sanitize_text(row.get(c))
                 fields.append(codebooks[c].get(raw, "x0"))
             else:
@@ -147,18 +153,18 @@ def quarter_key_from_period_str(s: str) -> str:
 def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
     a: Dict[str, Any] = {}
     g = cust_df.copy()
-    date_cols = [c for c in ["Billing Date", "Created On"] if c in g.columns]
+    date_cols = [c for c in ["BillingDocumentDate", "CreationDate"] if c in g.columns]
     date_col = date_cols[0] if date_cols else None
 
-    if "Document Currency" in g.columns:
-        cur_counts = g["Document Currency"].dropna().astype(str).value_counts()
+    if "TransactionCurrency" in g.columns:
+        cur_counts = g["TransactionCurrency"].dropna().astype(str).value_counts()
         a["currency_mode"] = (cur_counts.index[0] if not cur_counts.empty else "")
     else:
         a["currency_mode"] = ""
 
-    if "Net Value" in g.columns:
-        g["Net Value"] = pd.to_numeric(g["Net Value"], errors="coerce")
-    a["total_revenue_local"] = float(g["Net Value"].fillna(0).sum()) if "Net Value" in g.columns else 0.0
+    if "NetAmount" in g.columns:
+        g["NetAmount"] = pd.to_numeric(g["NetAmount"], errors="coerce")
+    a["total_revenue_local"] = float(g["NetAmount"].fillna(0).sum()) if "NetAmount" in g.columns else 0.0
 
     revenue_by_year: Dict[str, float] = {}
     revenue_by_quarter: Dict[str, float] = {}
@@ -166,10 +172,10 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
     if date_col:
         g[date_col] = pd.to_datetime(g[date_col], errors="coerce")
         g_valid = g[pd.notna(g[date_col])].copy()
-        if "Net Value" in g_valid.columns:
-            rev_series = g_valid.groupby(g_valid[date_col].dt.year)["Net Value"].sum(min_count=1)
+        if "NetAmount" in g_valid.columns:
+            rev_series = g_valid.groupby(g_valid[date_col].dt.year)["NetAmount"].sum(min_count=1)
             revenue_by_year = {str(int(k)): float(v) for k, v in rev_series.fillna(0).to_dict().items()}
-            q_series = g_valid.groupby(g_valid[date_col].dt.to_period("Q"))["Net Value"].sum(min_count=1)
+            q_series = g_valid.groupby(g_valid[date_col].dt.to_period("Q"))["NetAmount"].sum(min_count=1)
             revenue_by_quarter = {quarter_key_from_period_str(str(k)): float(v) for k, v in q_series.fillna(0).to_dict().items()}
 
         dts = g_valid[date_col].sort_values().dropna().astype("datetime64[ns]")
@@ -182,17 +188,17 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
     a["revenue_by_quarter"] = revenue_by_quarter
 
     item_col = None
-    if "Item Description" in g.columns:
-        item_col = "Item Description"
-    elif "Material Group" in g.columns:
-        item_col = "Material Group"
+    if "Item_Description" in g.columns:
+        item_col = "Item_Description"
+    elif "ProductGroup" in g.columns:
+        item_col = "ProductGroup"
 
     a["top_materials_by_revenue"] = []
     a["price_stats"] = []
     a["top_copurchase_pairs"] = []
 
     if item_col:
-        totals = g.groupby(item_col)["Net Value"].sum(min_count=1).fillna(0).sort_values(ascending=False)
+        totals = g.groupby(item_col)["NetAmount"].sum(min_count=1).fillna(0).sort_values(ascending=False)
         grand = float(totals.sum()) if not totals.empty else 0.0
         top_rows = totals.head(10)
         top_materials = []
@@ -201,10 +207,10 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
             top_materials.append({"material": str(mat), "revenue": float(val), "share": round(pct, 4)})
         a["top_materials_by_revenue"] = top_materials
 
-        if "Net Price" in g.columns:
+        if "NetAmount" in g.columns:
             price_stats = []
             for mat, sub in g.groupby(item_col):
-                prices = pd.to_numeric(sub["Net Price"], errors="coerce").dropna()
+                prices = pd.to_numeric(sub["NetAmount"], errors="coerce").dropna()
                 if prices.empty:
                     continue
                 avg = float(prices.mean())
@@ -237,12 +243,11 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
 
         a["best_price_by_material"] = best_price_materials
 
-
         date_key = None
-        if "Billing Date" in g.columns and g["Billing Date"].notna().any():
-            date_key = "Billing Date"
-        elif "Created On" in g.columns and g["Created On"].notna().any():
-            date_key = "Created On"
+        if "BillingDocumentDate" in g.columns and g["BillingDocumentDate"].notna().any():
+            date_key = "BillingDocumentDate"
+        elif "CreationDate" in g.columns and g["CreationDate"].notna().any():
+            date_key = "CreationDate"
 
         pair_counts = Counter()
         if date_key:
@@ -488,20 +493,28 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
     return out
 
 # =========================
-# Load CSV from GitHub URL
+# Load DF from SAP HANA
 # =========================
-def load_df_from_url(csv_url: str) -> pd.DataFrame:
-    try:
-        logger.info("Downloading CSV from URL %s", csv_url)
-        response = requests.get(csv_url)
-        response.raise_for_status()
-        data_string = response.text
-        df = pd.read_csv(io.StringIO(data_string), dtype=str)
-        logger.info("CSV loaded with shape=%s", df.shape)
-        return df
-    except Exception as e:
-        logger.exception("Failed to download or parse CSV from URL: %s", e)
-        raise
+def load_df_from_hana():
+    """Connect to SAP HANA Cloud and load data from the view"""
+    connection = dbapi.connect(
+        address=dbhost,
+        port=dbport,
+        user=dbuser,
+        password=dbpassword,
+        encrypt=True,
+        sslValidateCertificate=False
+    )
+    cursor = connection.cursor()
+    sqlquery = f"SELECT * FROM {dbschema}.{viewname}"
+    cursor.execute(sqlquery)
+    rows = cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    df = pd.DataFrame(rows, columns=columns)
+    cursor.close()
+    connection.close()
+    logger.info("Successfully loaded data from SAP HANA: %d rows, %d columns", len(df), len(df.columns))
+    return df
 
 # =========================
 # Clustering logic
@@ -509,7 +522,7 @@ def load_df_from_url(csv_url: str) -> pd.DataFrame:
 def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     g = g.copy()
     g["rev_pos"] = g["total_revenue"].clip(lower=0)
-    if g["Customer"].nunique() < 3:
+    if g["SoldToParty"].nunique() < 3:
         ranks = g["rev_pos"].rank(method="first", ascending=False)
         labels = np.where(
             ranks <= 1, "high_revenue",
@@ -531,9 +544,9 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
 # Load data and cluster at startup
 # =========================
 try:
-    raw_df = load_df_from_url(CSV_URL)
+    raw_df = load_df_from_hana()
 
-    for col in ["Created On", "Billing Date"]:
+    for col in ["BillingDocumentDate", "CreationDate"]:
         if col in raw_df.columns:
             raw_df[col] = pd.to_datetime(raw_df[col], errors="coerce")
     if CUSTOMER_COL not in raw_df.columns:
@@ -541,7 +554,7 @@ try:
 
     company_col = find_col(raw_df, COMPANY_COL_CANDIDATES)
     if company_col is None:
-        company_col = "company_code"
+        company_col = "BillingCompanyCode"
         raw_df[company_col] = "UNKNOWN"
 
     if REVENUE_COL not in raw_df.columns:
@@ -550,17 +563,17 @@ try:
     s = raw_df[REVENUE_COL].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
     raw_df[REVENUE_COL] = pd.to_numeric(s, errors="coerce").fillna(0.0)
 
-    if "Net Price" in raw_df.columns:
-        p = raw_df["Net Price"].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
-        raw_df["Net Price"] = pd.to_numeric(p, errors="coerce")
+    if "NetAmount" in raw_df.columns:
+        p = raw_df["NetAmount"].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
+        raw_df["NetAmount"] = pd.to_numeric(p, errors="coerce")
 
     raw_df[CUSTOMER_COL] = raw_df[CUSTOMER_COL].astype(str)
 
     logger.info("Non-null counts: Customer=%d, Net Value=%d, Created On=%d, Billing Date=%d",
                 raw_df[CUSTOMER_COL].notna().sum(),
                 raw_df[REVENUE_COL].notna().sum(),
-                raw_df["Created On"].notna().sum() if "Created On" in raw_df.columns else -1,
-                raw_df["Billing Date"].notna().sum() if "Billing Date" in raw_df.columns else -1)
+                raw_df["CreationDate"].notna().sum() if "CreationDate" in raw_df.columns else -1,
+                raw_df["BillingDocumentDate"].notna().sum() if "BillingDocumentDate" in raw_df.columns else -1)
 
     agg = (
         raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[REVENUE_COL]
@@ -595,11 +608,11 @@ try:
 
     clustered = (
         clustered.merge(pf, on=[company_col, CUSTOMER_COL], how="left")
-                 .rename(columns={company_col: "company_code", CUSTOMER_COL: "customer"})
+                 .rename(columns={company_col: "BillingCompanyCode", CUSTOMER_COL: "SoldToParty"})
     )
 
     clustered_data = clustered[[
-        "company_code", "customer", "total_revenue", "cluster_name",
+        "BillingCompanyCode", "SoldToParty", "total_revenue", "cluster_name",
         "revenue_rank_in_cluster", "purchasing_frequency"
     ]].copy()
 
@@ -646,16 +659,16 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         if cust_df.empty:
             raise HTTPException(status_code=404, detail="Customer not found")
 
-        nonnull_created = int(cust_df["Created On"].notna().sum()) if "Created On" in cust_df.columns else 0
-        nonnull_billed = int(cust_df["Billing Date"].notna().sum()) if "Billing Date" in cust_df.columns else 0
+        nonnull_created = int(cust_df["CreationDate"].notna().sum()) if "CreationDate" in cust_df.columns else 0
+        nonnull_billed = int(cust_df["BillingDocumentDate"].notna().sum()) if "BillingDocumentDate" in cust_df.columns else 0
         known_total_revenue = float(cust_df[REVENUE_COL].fillna(0).sum())
-        n_items = int(cust_df["Item Description"].notna().sum()) if "Item Description" in cust_df.columns else 0
-        n_prices = int(cust_df["Net Price"].notna().sum()) if "Net Price" in cust_df.columns else 0
+        n_items = int(cust_df["Item_Description"].notna().sum()) if "Item_Description" in cust_df.columns else 0
+        n_prices = int(cust_df["NetAmount"].notna().sum()) if "NetAmount" in cust_df.columns else 0
 
         aggregates_json = compute_aggregates_for_customer(cust_df)
         compact, nlines = full_transaction_block_for_customer(cust_df)
 
-        row = clustered_data[clustered_data["customer"] == str(customer_id)].head(1).to_dict("records")
+        row = clustered_data[clustered_data["SoldToParty"] == str(customer_id)].head(1).to_dict("records")
         ctx = row[0] if row else {}
         context_json = {
             "cluster_name": ctx.get("cluster_name", ""),
@@ -692,10 +705,9 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         if isinstance(parsed, dict):
             coerced = coerce_to_schema_with_cluster(parsed, customer_id=customer_id, cluster_name=cluster_name)
 
-                # Parse observation and recommendation strings into key-value lists
+            # Parse observation and recommendation strings into key-value lists
             coerced["observation"] = parse_nested_json_list_field(coerced.get("observation", ""))
             coerced["recommendation"] = parse_nested_json_list_field(coerced.get("recommendation", ""))
-
 
             if debug:
                 return {
@@ -713,7 +725,6 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
                     },
                 }
             return coerced
-
 
         fallback = {
             "customer": customer_id,
