@@ -1,0 +1,763 @@
+import re
+import ast
+import json
+import logging
+from hdbcli import dbapi
+from typing import Dict, Any, Tuple, List, Optional
+from collections import Counter
+from itertools import combinations
+
+import numpy as np
+import pandas as pd
+import io
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from sklearn.cluster import KMeans
+import google.generativeai as genai
+
+# =========================
+# Manual Config Variables
+# =========================
+# SAP HANA Connection Parameters
+GEMINI_API_KEY = "AIzaSyAsaqUkDY7IuFc12P9a7jBmJER9i2ft3BE"
+MODEL_NAME = "gemini-2.5-flash"
+
+dbuser = "DSP_CUST_CONTENT#DSP_CUST_CONTENT"
+dbpassword = "g6D,$a%@D`3$!)-GaVO#_[]T+=3z~[Z6"
+dbhost = "c0c94ed5-bef0-4ca4-95f8-55cf5a4ecbdc.hana.prod-us10.hanacloud.ondemand.com"
+dbport = 443
+dbschema = "DSP_CUST_CONTENT"
+viewname = "SALES_DATA_VIEW"
+
+CUSTOMER_COL = "Customer"
+REVENUE_COL = "Revenue"
+COMPANY_COL_CANDIDATES = [
+    "Company Code", "company code", "company_code", "Company", "company", "comp_code", "ccode"
+]
+SALES_DOC_CANDIDATES = [
+    "SalesDocument", "Sales Document Number", "Billing Document", "Billing Doc",
+    "Invoice Number", "Invoice", "Document Number"
+]
+KEEP_COLS = [
+    "Date", "Product Description", "Product Group",
+    "Volume", "ASP", "Revenue", "Currency"
+]
+
+# CORS allowed origins including React dev and deployed frontend
+origins = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://chrun-ai.vercel.app"
+]
+ALLOW_CREDENTIALS = True
+
+# =========================
+# Logging config
+# =========================
+logging.basicConfig(
+    level="INFO",
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+logger = logging.getLogger("customer-insights")
+
+# =========================
+# LLM Auth using API Key
+# =========================
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is required for LLM authentication")
+
+try:
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(MODEL_NAME)
+    logger.info("Configured Google Generative AI client with API key")
+except Exception as e:
+    logger.exception("Failed to configure Generative AI client: %s", e)
+    raise
+
+# =========================
+# Helper Functions
+# =========================
+def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols_lc = {c.lower(): c for c in df.columns}
+    for name in candidates:
+        if name in df.columns:
+            return name
+        if name.lower() in cols_lc:
+            return cols_lc[name.lower()]
+    return None
+
+def sanitize_text(x: Any) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("|", "/")
+    return s
+
+def norm_date(d):
+    if pd.isna(d):
+        return ""
+    val = pd.to_datetime(d, errors="coerce")
+    return val.strftime("%Y%m%d") if pd.notna(val) else ""
+
+def norm_num(x, ndigits=2):
+    if pd.isna(x):
+        return ""
+    try:
+        return str(round(float(x), ndigits))
+    except Exception:
+        return ""
+
+def build_codebook(series: pd.Series) -> Dict[str, str]:
+    vc = series.dropna().astype(str).value_counts()
+    return {v: f"x{i+1}" for i, v in enumerate(vc.index.tolist())}
+
+def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int]:
+    g = cust_df.copy()
+    date_cols = [c for c in ["Date"] if c in g.columns]
+    date_col = date_cols[0] if date_cols else None
+    if date_col:
+        g = g.sort_values(by=[date_col]).reset_index(drop=True)
+
+    keep_cols = [c for c in KEEP_COLS if c in g.columns]
+    codebooks: Dict[str, Dict[str, str]] = {}
+    cat_cols = [c for c in ["Product Description", "Product Group", "Currency"] if c in g.columns]
+    for c in cat_cols:
+        codebooks[c] = build_codebook(g[c])
+
+    header = "COLUMNS|" + "|".join([sanitize_text(c) for c in keep_cols])
+    code_header = "CODES|" + json.dumps(codebooks, separators=(",", ":"), ensure_ascii=False)
+
+    data_lines = []
+    for _, row in g.iterrows():
+        fields = []
+        for c in keep_cols:
+            if c in ["Date"]:
+                fields.append(norm_date(row.get(c)))
+            elif c in ["Volume", "ASP", "Revenue"]:
+                fields.append(norm_num(row.get(c)))
+            elif c in ["Product Description", "Product Group", "Currency"]:
+                raw = sanitize_text(row.get(c))
+                fields.append(codebooks[c].get(raw, "x0"))
+            else:
+                fields.append(sanitize_text(row.get(c)))
+        data_lines.append("ROW|" + "|".join(fields))
+
+    compact_text = "\n".join([header, code_header] + data_lines)
+    return compact_text, len(data_lines)
+
+def quarter_key_from_period_str(s: str) -> str:
+    return s.replace("Q", "-Q")
+
+def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
+    a: Dict[str, Any] = {}
+    g = cust_df.copy()
+    date_cols = [c for c in ["Date"] if c in g.columns]
+    date_col = date_cols[0] if date_cols else None
+
+    if "Currency" in g.columns:
+        cur_counts = g["Currency"].dropna().astype(str).value_counts()
+        a["currency_mode"] = (cur_counts.index[0] if not cur_counts.empty else "")
+    else:
+        a["currency_mode"] = ""
+
+    if "Revenue" in g.columns:
+        g["Revenue"] = pd.to_numeric(g["Revenue"], errors="coerce")
+    a["total_revenue_local"] = float(g["Revenue"].fillna(0).sum()) if "Revenue" in g.columns else 0.0
+
+    revenue_by_year: Dict[str, float] = {}
+    revenue_by_quarter: Dict[str, float] = {}
+
+    if date_col:
+        g[date_col] = pd.to_datetime(g[date_col], errors="coerce")
+        g_valid = g[pd.notna(g[date_col])].copy()
+        if "Revenue" in g_valid.columns:
+            rev_series = g_valid.groupby(g_valid[date_col].dt.year)["Revenue"].sum(min_count=1)
+            revenue_by_year = {str(int(k)): float(v) for k, v in rev_series.fillna(0).to_dict().items()}
+            q_series = g_valid.groupby(g_valid[date_col].dt.to_period("Q"))["Revenue"].sum(min_count=1)
+            revenue_by_quarter = {quarter_key_from_period_str(str(k)): float(v) for k, v in q_series.fillna(0).to_dict().items()}
+
+        dts = g_valid[date_col].sort_values().dropna().astype("datetime64[ns]")
+        diffs = dts.diff().dt.days.dropna()
+        a["median_days_between_orders"] = float(np.median(diffs)) if not diffs.empty else 0.0
+    else:
+        a["median_days_between_orders"] = 0.0
+
+    a["revenue_by_year"] = revenue_by_year
+    a["revenue_by_quarter"] = revenue_by_quarter
+
+    item_col = None
+    if "Product Description" in g.columns:
+        item_col = "Product Description"
+    elif "Product Group" in g.columns:
+        item_col = "Product Group"
+
+    a["top_materials_by_revenue"] = []
+    a["price_stats"] = []
+    a["top_copurchase_pairs"] = []
+
+    if item_col:
+        totals = g.groupby(item_col)["Revenue"].sum(min_count=1).fillna(0).sort_values(ascending=False)
+        grand = float(totals.sum()) if not totals.empty else 0.0
+        top_rows = totals.head(10)
+        top_materials = []
+        for mat, val in top_rows.items():
+            pct = (float(val) / grand) if grand > 0 else 0.0
+            top_materials.append({"material": str(mat), "revenue": float(val), "share": round(pct, 4)})
+        a["top_materials_by_revenue"] = top_materials
+
+        if "Revenue" in g.columns:
+            price_stats = []
+            for mat, sub in g.groupby(item_col):
+                prices = pd.to_numeric(sub["Revenue"], errors="coerce").dropna()
+                if prices.empty:
+                    continue
+                avg = float(prices.mean())
+                std = float(prices.std(ddof=0)) if len(prices) > 1 else 0.0
+                cv = (std / avg) if avg > 0 else 0.0
+                price_stats.append({"material": str(mat), "avg_price": round(avg, 4), "cv": round(cv, 4)})
+            if top_materials:
+                top_set = {t["material"] for t in top_materials}
+                price_stats_sorted = sorted(price_stats, key=lambda d: (d["material"] not in top_set, d["material"]))
+                a["price_stats"] = price_stats_sorted[:20]
+            else:
+                a["price_stats"] = price_stats[:20]
+
+        # Build a map of material -> avg_price from price_stats (average 'current' prices)
+        price_stats_map = {p["material"]: p["avg_price"] for p in a.get("price_stats", [])}
+
+        # Update best_price_by_material entries to add "current_price"
+        best_price_materials = []
+        for entry in a.get("best_price_by_material", []):
+            material = entry.get("material", "")
+            suggested_price = entry.get("suggested_price", 0.0)
+            discount = entry.get("discount", "")
+            current_price = price_stats_map.get(material, 0.0)
+            best_price_materials.append({
+                "material": material,
+                "current_price": round(current_price, 4),
+                "suggested_price": suggested_price,
+                "discount": discount,
+            })
+
+        a["best_price_by_material"] = best_price_materials
+
+        date_key = None
+        if "Date" in g.columns and g["Date"].notna().any():
+            date_key = "Date"
+
+        pair_counts = Counter()
+        if date_key:
+            g[date_key] = pd.to_datetime(g[date_key], errors="coerce")
+            for dt, sub in g.groupby(g[date_key].dt.date):
+                mats = sorted(set(sub[item_col].dropna().astype(str).tolist()))
+                if len(mats) < 2:
+                    continue
+                for a_mat, b_mat in combinations(mats, 2):
+                    pair_counts[(a_mat, b_mat)] += 1
+        top_pairs = [{"a": a_m, "b": b_m, "count": int(c)} for (a_m, b_m), c in pair_counts.most_common(5)]
+        a["top_copurchase_pairs"] = top_pairs
+
+    a["total_records"] = int(len(g))
+    if date_col and g[date_col].notna().any():
+        a["distinct_days"] = int(g[date_key].dt.date.nunique())
+    else:
+        a["distinct_days"] = 0
+
+    return a
+
+def parse_insights_to_kv_list(text: str) -> List[Dict[str, str]]:
+    lines = [line.strip() for line in text.split("\n") if line.strip()]
+    kv_list = []
+    for line in lines:
+        if ":" in line:
+            key, value = line.split(":", 1)
+        elif "-" in line:
+            key, value = line.split("-", 1)
+        elif "," in line:
+            key, value = line.split(",", 1)
+        else:
+            parts = line.split()
+            key = " ".join(parts[:2])
+            value = " ".join(parts[2:]) if len(parts) > 2 else ""
+        kv_list.append({"key": key.strip(), "value": value.strip()})
+    return kv_list
+
+def parse_nested_json_list_field(field_value):
+    """
+    If field_value is a string that looks like a list of dicts, convert it to actual list.
+    Else, return as-is.
+    """
+    if isinstance(field_value, str):
+        try:
+            # Use literal_eval to safely evaluate string to python list/dict
+            val = ast.literal_eval(field_value)
+            if isinstance(val, list):
+                return val
+        except Exception:
+            pass
+    return field_value
+
+PROMPT_TEMPLATE = """
+
+Your role is to speak the language of account management, sales leadership, and P&L accountability—not data science.
+
+Task:
+
+Deliver actionable retention insights centered on account profitability, purchase cadence, customer value, competitive pricing pressure, and product portfolio balance.
+
+Use a commercial lens to assess risk and recommend revenue protection or growth actions.
+
+When competitive products are present, blend internal transaction performance with competitive pricing insights to guide offer structure and positioning.
+
+When no competition exists for purchased items, base the analysis purely on internal transaction dynamics and customer value trends.
+
+JSON schema to return:
+{
+"customer": "<string>",
+"cluster": "<string>",
+"churn": "yes|no",
+"churn_analysis": "<max 20 words>",
+"retention_strategies": "<max 20 words>",
+"Retention_offers": "<max 20 words>",
+"Purchase_details": "<materials bought frequently + revenue, max 20 words>",
+"revenue_by_year": { "YYYY": number, "...": number },
+"revenue_by_quarter": { "YYYY-QN": number, "...": number },
+"trend_of_sales": "<max 40 words>",
+"product_combination": "<max 20 words>",
+"best_price_by_material": [ { "material": "<code or name>", "current_price": <number>, "suggested_price": <number>, "discount": "<e.g. 5-10%>" } ],
+"observation": [
+  {"key": "<concise insight title>", "value": "<actionable business insight>"}
+],
+"recommendation": [
+  {"key": "<action title>", "value": "<specific sales/retention recommendation>"}
+]
+}
+
+Tone and Style Requirements:
+
+Use clear, commercially actionable language—avoid technical or analytical jargon.
+
+Emphasize account growth, profit protection, and competitive advantage.
+
+Frame all commentary as if speaking to sales and regional leadership teams responsible for revenue delivery.
+
+"observation" and "recommendation" must be written as concise bullet-style action insights with a business lens, not paragraphs.
+
+For "observation" and "recommendation", return JSON arrays where each item is an object with "key" and "value", representing bullet-point insights and recommendations in clear business terms.
+
+Each bullet point should reflect tactical or strategic actions tied to account health, margin preservation, or share-of-wallet defense.
+
+Competitive Pricing Context (apply only when competitors exist for customer's products):
+
+BEV SYRUP: Sysco (15% cheaper), US Foods (8% cheaper), Performance Food Group (12% cheaper)
+
+SAUCES: Sysco (10% cheaper), US Foods (5% cheaper), Gordon Food Service (7% cheaper)
+
+SYRUPS: US Foods (12% cheaper), Sysco (18% cheaper), Reinhart (9% cheaper)
+
+TOPPINGS: Gordon Food Service (6% cheaper), US Foods (4% cheaper), Sysco (11% cheaper)
+
+FILLINGS: Performance Food Group (13% cheaper), Sysco (8% cheaper), US Foods (10% cheaper)
+
+NOTE: If customer's primary products are NOT in the above competitive categories, treat as EXCLUSIVE products with no market competition and ignore competitive factors.
+
+Inputs:
+
+customer_id = [[CUSTOMER_ID]]
+
+known_total_revenue = [[KNOWN_TOTAL_REVENUE]]
+
+aggregates_json = [[AGGREGATES_JSON]]
+
+context = [[CONTEXT_JSON]]
+
+recent_history (FULL, all transactions for this customer; compacted):
+
+The first line begins with COLUMNS| and lists field order.
+
+The second line begins with CODES| and is a JSON map of categorical value→short code (unlisted→x0 as OTHER).
+
+Each subsequent line begins with ROW| and provides one transaction aligned to COLUMNS.
+
+Recent history (compressed):
+[[COMPACT_BLOCK]]
+
+Analysis Rules:
+
+Use aggregates_json for totals, cadence, top materials, and value patterns.
+
+Combine transaction flow, pricing pressure, and buyer consistency to assess churn likelihood.
+
+Apply competitive weighting:
+
+Products with competitors → 25% weight to price gap and 75% to account behavior.
+
+Exclusive products → transaction & value performance only.
+
+Price recommendations = average realized price adjusted for margin sustainability and competitive gap.
+
+Retention offers → clearly state value proposition versus competitors (price, reliability, supply, service).
+
+Observations → list 4–5 concise business insights as bullet points about customer behavior, trends, or risks.
+
+Recommendations → list 4–5 actionable commercial levers (e.g., pricing move, bundle opportunity, cross-sell, relationship action). Also in Recommendations one key value pair should always be about ROI for next quater is the suggested changes are done.
+
+For unavailable data, use "" for strings, {} or [] for objects/arrays, and 0 for numbers.
+
+Output MUST be a single JSON object exactly per schema; no extra keys.
+""".strip()
+
+def build_main_prompt(customer_id: str,
+                      known_total_revenue: float,
+                      aggregates_json: Dict[str, Any],
+                      compact_block: str,
+                      context_json: Dict[str, Any]) -> str:
+    prompt = PROMPT_TEMPLATE
+    prompt = prompt.replace("[[CUSTOMER_ID]]", json.dumps(customer_id, ensure_ascii=False))
+    prompt = prompt.replace("[[KNOWN_TOTAL_REVENUE]]", str(round(float(known_total_revenue or 0.0), 4)))
+    prompt = prompt.replace("[[AGGREGATES_JSON]]", json.dumps(aggregates_json, separators=(",", ":"), ensure_ascii=False))
+    prompt = prompt.replace("[[CONTEXT_JSON]]", json.dumps(context_json, separators=(",", ":"), ensure_ascii=False))
+    prompt = prompt.replace("[[COMPACT_BLOCK]]", compact_block)
+    return prompt
+
+def try_parse_json(text: str):
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text or "", flags=re.DOTALL)
+    if m:
+        snippet = m.group(0)
+        try:
+            return json.loads(snippet)
+        except Exception:
+            pass
+    return None
+
+def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster_name: str) -> Dict[str, Any]:
+    out = {
+        "customer": str(obj.get("customer", customer_id or "")),
+        "cluster": str(cluster_name or obj.get("cluster", "")),
+        "churn": str(obj.get("churn", "")),
+        "churn_analysis": str(obj.get("churn_analysis", obj.get("reason_churn_decision", ""))),
+        "retention_strategies": str(obj.get("retention_strategies", obj.get("how_to_retain", ""))),
+        "Retention_offers": str(obj.get("Retention_offers", obj.get("offers_we_can_provide", ""))),
+        "Purchase_details": str(obj.get("Purchase_details", obj.get("details", ""))),
+        "revenue_by_year": {},
+        "revenue_by_quarter": {},
+        "trend_of_sales": str(obj.get("trend_of_sales", obj.get("trend_of_buying", ""))),
+        "product_combination": str(obj.get("product_combination", "")),
+        "best_price_by_material": [],
+        "observation": str(obj.get("observation", "")),
+        "recommendation": str(obj.get("recommendation", "")),
+    }
+    for dict_key, legacy in [("revenue_by_year", "revenue_by_year"), ("revenue_by_quarter", "revenue_by_quarter")]:
+        rb = obj.get(dict_key, obj.get(legacy, {}))
+        if isinstance(rb, dict):
+            fixed = {}
+            for k, v in rb.items():
+                try:
+                    fixed[str(k)] = float(v)
+                except Exception:
+                    fixed[str(k)] = 0.0
+            out[dict_key] = fixed
+    bp = obj.get("best_price_by_material", obj.get("best_price_by_material", []))
+    if isinstance(bp, list):
+        cleaned = []
+        for item in bp:
+            if not isinstance(item, dict):
+                continue
+            cleaned.append({
+                "material": str(item.get("material", "")),
+                "current_price": float(item.get("current_price", 0) or 0),
+                "suggested_price": float(item.get("suggested_price", 0) or 0),
+                "discount": str(item.get("discount", "")),
+            })
+        out["best_price_by_material"] = cleaned
+    def trim_words(s: str, n: int) -> str:
+        toks = str(s).split()
+        return " ".join(toks[:n])
+    out["churn_analysis"] = trim_words(out["churn_analysis"], 20)
+    out["retention_strategies"] = trim_words(out["retention_strategies"], 20)
+    out["Retention_offers"] = trim_words(out["Retention_offers"], 20)
+    out["Purchase_details"] = trim_words(out["Purchase_details"], 20)
+    out["trend_of_sales"] = trim_words(out["trend_of_sales"], 40)
+    out["product_combination"] = trim_words(out["product_combination"], 20)
+    churn = out["churn"].strip().lower()
+    if churn not in {"yes", "no"}:
+        out["churn"] = ""
+    return out
+
+# =========================
+# Load DF from SAP HANA
+# =========================
+def load_df_from_hana():
+    """Connect to SAP HANA Cloud and load data from the view"""
+    connection = dbapi.connect(
+        address=dbhost,
+        port=dbport,
+        user=dbuser,
+        password=dbpassword,
+        encrypt=True,
+        sslValidateCertificate=False
+    )
+    cursor = connection.cursor()
+    sqlquery = f"SELECT * FROM {dbschema}.{viewname}"
+    cursor.execute(sqlquery)
+    rows = cursor.fetchall()
+    columns = [desc[0] for desc in cursor.description]
+    df = pd.DataFrame(rows, columns=columns)
+    cursor.close()
+    connection.close()
+    logger.info("Successfully loaded data from SAP HANA: %d rows, %d columns", len(df), len(df.columns))
+    return df
+
+# =========================
+# Clustering logic
+# =========================
+def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
+    g = g.copy()
+    g["rev_pos"] = g["total_revenue"].clip(lower=0)
+    if g[CUSTOMER_COL].nunique() < 3:
+        ranks = g["rev_pos"].rank(method="first", ascending=False)
+        labels = np.where(
+            ranks <= 1, "high_revenue",
+            np.where(ranks <= 2, "mixed_revenue", "low_revenue")
+        )
+        g["cluster_name"] = labels
+        g["cluster_id"] = g["cluster_name"].map({"high_revenue": 0, "mixed_revenue": 1, "low_revenue": 2}).fillna(2).astype(int)
+        return g.drop(columns=["rev_pos"])
+    X = np.log1p(g["rev_pos"]).to_numpy().reshape(-1, 1)
+    km = KMeans(n_clusters=3, n_init=50, random_state=42)
+    g["km_id"] = km.fit_predict(X)
+    means = g.groupby("km_id")["rev_pos"].mean().sort_values(ascending=False)
+    order = {cid: idx for idx, cid in enumerate(means.index)}
+    g["cluster_id"] = g["km_id"].map(order)
+    g["cluster_name"] = g["cluster_id"].map({0: "high_revenue", 1: "mixed_revenue", 2: "low_revenue"})
+    return g.drop(columns=["rev_pos", "km_id"])
+
+# =========================
+# Load data and cluster at startup
+# =========================
+try:
+    raw_df = load_df_from_hana()
+
+    for col in ["Date"]:
+        if col in raw_df.columns:
+            raw_df[col] = pd.to_datetime(raw_df[col], errors="coerce")
+    if CUSTOMER_COL not in raw_df.columns:
+        raise ValueError(f"Missing required column: {CUSTOMER_COL}")
+
+    company_col = find_col(raw_df, COMPANY_COL_CANDIDATES)
+    if company_col is None:
+        company_col = "Company Code"
+        raw_df[company_col] = "UNKNOWN"
+
+    if REVENUE_COL not in raw_df.columns:
+        raise ValueError(f"Missing revenue column: {REVENUE_COL}")
+
+    s = raw_df[REVENUE_COL].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
+    raw_df[REVENUE_COL] = pd.to_numeric(s, errors="coerce").fillna(0.0)
+
+    # Numeric cleanup for related numeric fields if present
+    for num_col in ["ASP", "Volume"]:
+        if num_col in raw_df.columns:
+            tmp = raw_df[num_col].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
+            raw_df[num_col] = pd.to_numeric(tmp, errors="coerce")
+
+    raw_df[CUSTOMER_COL] = raw_df[CUSTOMER_COL].astype(str)
+
+    logger.info(
+        "Non-null counts: Customer=%d, Revenue=%d, Date=%d",
+        raw_df[CUSTOMER_COL].notna().sum(),
+        raw_df[REVENUE_COL].notna().sum(),
+        raw_df["Date"].notna().sum() if "Date" in raw_df.columns else -1
+    )
+
+    agg = (
+        raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[REVENUE_COL]
+              .sum(min_count=1)
+              .reset_index()
+              .rename(columns={REVENUE_COL: "total_revenue"})
+    )
+    agg["total_revenue"] = agg["total_revenue"].fillna(0.0).astype(float)
+
+    sales_doc_col = find_col(raw_df, SALES_DOC_CANDIDATES)
+    if sales_doc_col and sales_doc_col in raw_df.columns:
+        pf = (
+            raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[sales_doc_col]
+                  .nunique(dropna=True)
+                  .reset_index()
+                  .rename(columns={sales_doc_col: "purchasing_frequency"})
+        )
+    else:
+        pf = agg[[company_col, CUSTOMER_COL]].copy()
+        pf["purchasing_frequency"] = 0
+
+    clustered_list = []
+    for _, g in agg.groupby(company_col, dropna=False):
+        clustered_list.append(cluster_one_company(g))
+    clustered = pd.concat(clustered_list, ignore_index=True)
+
+    clustered["revenue_rank_in_cluster"] = (
+        clustered.groupby([company_col, "cluster_id"])["total_revenue"]
+                 .rank(method="dense", ascending=False)
+                 .astype(int)
+    )
+
+    clustered = (
+        clustered.merge(pf, on=[company_col, CUSTOMER_COL], how="left")
+                 .rename(columns={company_col: "company_code", CUSTOMER_COL: "customer"})
+    )
+
+    clustered_data = clustered[[
+        "company_code", "customer", "total_revenue", "cluster_name",
+        "revenue_rank_in_cluster", "purchasing_frequency"
+    ]].copy()
+
+    logger.info("clustered_data rows=%d, sample=%s", len(clustered_data), clustered_data.head(3).to_dict("records"))
+
+except Exception as e:
+    logger.exception("Error during data load and clustering: %s", e)
+    raw_df = pd.DataFrame()
+    clustered_data = pd.DataFrame()
+
+# =========================
+# FastAPI app & CORS middleware
+# =========================
+app = FastAPI(title="Customer Clustering and Insights API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=ALLOW_CREDENTIALS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
+    max_age=600,
+)
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "rows": int(len(raw_df)), "clustered_rows": int(len(clustered_data))}
+
+@app.get("/clustered-data")
+async def get_clustered_data():
+    logger.info("GET /clustered-data")
+    return clustered_data.to_dict(orient="records")
+
+@app.get("/customer-insights/{customer_id}")
+async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
+    logger.info("GET /customer-insights/%s debug=%s", customer_id, debug)
+    try:
+        cust_df = raw_df[raw_df[CUSTOMER_COL].astype(str) == str(customer_id)]
+        if cust_df.empty:
+            raise HTTPException(status_code=404, detail="Customer not found")
+
+        nonnull_date = int(cust_df["Date"].notna().sum()) if "Date" in cust_df.columns else 0
+        known_total_revenue = float(cust_df[REVENUE_COL].fillna(0).sum())
+        n_items = int(cust_df["Product Description"].notna().sum()) if "Product Description" in cust_df.columns else 0
+        n_prices = int(cust_df["Revenue"].notna().sum()) if "Revenue" in cust_df.columns else 0
+
+        aggregates_json = compute_aggregates_for_customer(cust_df)
+        compact, nlines = full_transaction_block_for_customer(cust_df)
+
+        row = clustered_data[clustered_data["customer"] == str(customer_id)].head(1).to_dict("records")
+        ctx = row[0] if row else {}
+        context_json = {
+            "cluster_name": ctx.get("cluster_name", ""),
+            "revenue_rank_in_cluster": int(ctx.get("revenue_rank_in_cluster", 0) or 0),
+            "purchasing_frequency": int(ctx.get("purchasing_frequency", 0) or 0),
+            "known_total_revenue_from_cluster": float(ctx.get("total_revenue", known_total_revenue)),
+        }
+
+        prompt = build_main_prompt(
+            customer_id=customer_id,
+            known_total_revenue=known_total_revenue,
+            aggregates_json=aggregates_json,
+            compact_block=compact,
+            context_json=context_json,
+        )
+
+        logger.info(
+            "cust_rows=%d rev_sum=%.2f all_rows=%d date_nz=%d items=%d prices=%d prompt_chars=%d",
+            len(cust_df), known_total_revenue, nlines, nonnull_date, n_items, n_prices, len(prompt)
+        )
+
+        raw_text = ""
+        parsed = None
+        try:
+            resp = model.generate_content(prompt)
+            raw_text = (resp.text or "")
+            logger.info("LLM raw_text_len=%d", len(raw_text))
+            logger.debug("LLM raw_text_head=%s", raw_text[:400].replace("\n", " "))
+            parsed = try_parse_json(raw_text)
+        except Exception as e:
+            logger.error("LLM call failed: %s", e)
+
+        cluster_name = context_json.get("cluster_name", "")
+        if isinstance(parsed, dict):
+            coerced = coerce_to_schema_with_cluster(parsed, customer_id=customer_id, cluster_name=cluster_name)
+
+            # Parse observation and recommendation strings into key-value lists
+            coerced["observation"] = parse_nested_json_list_field(coerced.get("observation", ""))
+            coerced["recommendation"] = parse_nested_json_list_field(coerced.get("recommendation", ""))
+
+            if debug:
+                return {
+                    "result": coerced,
+                    "debug": {
+                        "cust_rows": int(len(cust_df)),
+                        "known_total_revenue": known_total_revenue,
+                        "all_rows": int(nlines),
+                        "nonnull_date": nonnull_date,
+                        "n_items": n_items,
+                        "n_prices": n_prices,
+                        "raw_text_head": raw_text[:400],
+                        "parsed": True,
+                    },
+                }
+            return coerced
+
+        fallback = {
+            "customer": customer_id,
+            "cluster": cluster_name,
+            "churn": "",
+            "churn_analysis": "",
+            "retention_strategies": "",
+            "Retention_offers": "",
+            "Purchase_details": "",
+            "revenue_by_year": {},
+            "revenue_by_quarter": {},
+            "trend_of_sales": "",
+            "product_combination": "",
+            "best_price_by_material": [],
+            "observation": "",
+            "recommendation": "",
+        }
+        if debug:
+            return {
+                "result": fallback,
+                "debug": {
+                    "cust_rows": int(len(cust_df)),
+                    "known_total_revenue": known_total_revenue,
+                    "all_rows": int(nlines),
+                    "nonnull_date": nonnull_date,
+                    "n_items": n_items,
+                    "n_prices": n_prices,
+                    "raw_text_head": raw_text[:400],
+                    "parsed": False,
+                },
+            }
+        return fallback
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unexpected error in get_customer_insights for customer %s: %s", customer_id, e)
+        raise HTTPException(status_code=500, detail="Internal server error")
