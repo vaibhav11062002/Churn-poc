@@ -614,11 +614,6 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     try:
         cust_df = raw_df[raw_df[CUSTOMER_COL].astype(str) == str(customer_id)]
 
-        # ===== NEW: Keep only the most recent N records =====
-        N = 100  # Choose N as needed
-        if "Date" in cust_df.columns and len(cust_df) > N:
-            cust_df = cust_df.sort_values(by="Date", ascending=False).head(N).copy()
-
         if cust_df.empty:
             raise HTTPException(status_code=404, detail="Customer not found")
 
