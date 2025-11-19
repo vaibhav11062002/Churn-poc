@@ -18,7 +18,6 @@ import google.generativeai as genai
 # =========================
 # Manual Config Variables
 # =========================
-# SAP HANA Connection Parameters
 GEMINI_API_KEY = "AIzaSyAsaqUkDY7IuFc12P9a7jBmJER9i2ft3BE"
 MODEL_NAME = "gemini-2.5-flash"
 
@@ -34,16 +33,11 @@ REVENUE_COL = "Revenue"
 COMPANY_COL_CANDIDATES = [
     "Company Code", "company code", "company_code", "Company", "company", "comp_code", "ccode"
 ]
-SALES_DOC_CANDIDATES = [
-    "SalesDocument", "Sales Document Number", "Billing Document", "Billing Doc",
-    "Invoice Number", "Invoice", "Document Number"
-]
 KEEP_COLS = [
     "Date", "Product Description", "Product Group",
     "Volume", "ASP", "Revenue", "Currency"
 ]
 
-# CORS allowed origins including React dev and deployed frontend
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -52,17 +46,12 @@ origins = [
 ALLOW_CREDENTIALS = True
 
 # =========================
-# Logging config
-# =========================
 logging.basicConfig(
     level="INFO",
     format="%(asctime)s %(levelname)s %(name)s - %(message)s",
 )
 logger = logging.getLogger("customer-insights")
 
-# =========================
-# LLM Auth using API Key
-# =========================
 if not GEMINI_API_KEY:
     raise RuntimeError("GEMINI_API_KEY is required for LLM authentication")
 
@@ -74,9 +63,6 @@ except Exception as e:
     logger.exception("Failed to configure Generative AI client: %s", e)
     raise
 
-# =========================
-# Helper Functions
-# =========================
 def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
     cols_lc = {c.lower(): c for c in df.columns}
     for name in candidates:
@@ -223,10 +209,7 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
             else:
                 a["price_stats"] = price_stats[:20]
 
-        # Build a map of material -> avg_price from price_stats (average 'current' prices)
         price_stats_map = {p["material"]: p["avg_price"] for p in a.get("price_stats", [])}
-
-        # Update best_price_by_material entries to add "current_price"
         best_price_materials = []
         for entry in a.get("best_price_by_material", []):
             material = entry.get("material", "")
@@ -239,13 +222,11 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
                 "suggested_price": suggested_price,
                 "discount": discount,
             })
-
         a["best_price_by_material"] = best_price_materials
 
         date_key = None
         if "Date" in g.columns and g["Date"].notna().any():
             date_key = "Date"
-
         pair_counts = Counter()
         if date_key:
             g[date_key] = pd.to_datetime(g[date_key], errors="coerce")
@@ -284,13 +265,8 @@ def parse_insights_to_kv_list(text: str) -> List[Dict[str, str]]:
     return kv_list
 
 def parse_nested_json_list_field(field_value):
-    """
-    If field_value is a string that looks like a list of dicts, convert it to actual list.
-    Else, return as-is.
-    """
     if isinstance(field_value, str):
         try:
-            # Use literal_eval to safely evaluate string to python list/dict
             val = ast.literal_eval(field_value)
             if isinstance(val, list):
                 return val
@@ -489,11 +465,7 @@ def coerce_to_schema_with_cluster(obj: Dict[str, Any], customer_id: str, cluster
         out["churn"] = ""
     return out
 
-# =========================
-# Load DF from SAP HANA
-# =========================
 def load_df_from_hana():
-    """Connect to SAP HANA Cloud and load data from the view"""
     connection = dbapi.connect(
         address=dbhost,
         port=dbport,
@@ -513,9 +485,6 @@ def load_df_from_hana():
     logger.info("Successfully loaded data from SAP HANA: %d rows, %d columns", len(df), len(df.columns))
     return df
 
-# =========================
-# Clustering logic
-# =========================
 def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     g = g.copy()
     g["rev_pos"] = g["total_revenue"].clip(lower=0)
@@ -537,9 +506,6 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     g["cluster_name"] = g["cluster_id"].map({0: "high_revenue", 1: "mixed_revenue", 2: "low_revenue"})
     return g.drop(columns=["rev_pos", "km_id"])
 
-# =========================
-# Load data and cluster at startup
-# =========================
 try:
     raw_df = load_df_from_hana()
 
@@ -559,8 +525,6 @@ try:
 
     s = raw_df[REVENUE_COL].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
     raw_df[REVENUE_COL] = pd.to_numeric(s, errors="coerce").fillna(0.0)
-
-    # Numeric cleanup for related numeric fields if present
     for num_col in ["ASP", "Volume"]:
         if num_col in raw_df.columns:
             tmp = raw_df[num_col].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
@@ -583,17 +547,13 @@ try:
     )
     agg["total_revenue"] = agg["total_revenue"].fillna(0.0).astype(float)
 
-    sales_doc_col = find_col(raw_df, SALES_DOC_CANDIDATES)
-    if sales_doc_col and sales_doc_col in raw_df.columns:
-        pf = (
-            raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[sales_doc_col]
-                  .nunique(dropna=True)
-                  .reset_index()
-                  .rename(columns={sales_doc_col: "purchasing_frequency"})
-        )
-    else:
-        pf = agg[[company_col, CUSTOMER_COL]].copy()
-        pf["purchasing_frequency"] = 0
+    # PURCHASING FREQUENCY: Count of rows per company+customer (change)
+    pf = (
+        raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)
+              .size()
+              .reset_index()
+              .rename(columns={0: "purchasing_frequency"})
+    )
 
     clustered_list = []
     for _, g in agg.groupby(company_col, dropna=False):
@@ -623,9 +583,6 @@ except Exception as e:
     raw_df = pd.DataFrame()
     clustered_data = pd.DataFrame()
 
-# =========================
-# FastAPI app & CORS middleware
-# =========================
 app = FastAPI(title="Customer Clustering and Insights API")
 
 app.add_middleware(
@@ -656,6 +613,12 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     logger.info("GET /customer-insights/%s debug=%s", customer_id, debug)
     try:
         cust_df = raw_df[raw_df[CUSTOMER_COL].astype(str) == str(customer_id)]
+
+        # ===== NEW: Keep only the most recent N records =====
+        N = 100  # Choose N as needed
+        if "Date" in cust_df.columns and len(cust_df) > N:
+            cust_df = cust_df.sort_values(by="Date", ascending=False).head(N).copy()
+
         if cust_df.empty:
             raise HTTPException(status_code=404, detail="Customer not found")
 
@@ -704,7 +667,6 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         if isinstance(parsed, dict):
             coerced = coerce_to_schema_with_cluster(parsed, customer_id=customer_id, cluster_name=cluster_name)
 
-            # Parse observation and recommendation strings into key-value lists
             coerced["observation"] = parse_nested_json_list_field(coerced.get("observation", ""))
             coerced["recommendation"] = parse_nested_json_list_field(coerced.get("recommendation", ""))
 
@@ -761,3 +723,4 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     except Exception as e:
         logger.exception("Unexpected error in get_customer_insights for customer %s: %s", customer_id, e)
         raise HTTPException(status_code=500, detail="Internal server error")
+
