@@ -27,21 +27,20 @@ dbpassword = "g6D,$a%@D`3$!)-GaVO#_[]T+=3z~[Z6"
 dbhost = "c0c94ed5-bef0-4ca4-95f8-55cf5a4ecbdc.hana.prod-us10.hanacloud.ondemand.com"
 dbport = 443
 dbschema = "DSP_CUST_CONTENT"
-viewname = "SALES_ORDER_CUST_SEGMENTATION"
+viewname = "SALES_DATA_VIEW"
 
-CUSTOMER_COL = "SoldToParty"
-REVENUE_COL = "NetAmount"
+CUSTOMER_COL = "Customer"
+REVENUE_COL = "Revenue"
 COMPANY_COL_CANDIDATES = [
-    "Company Code", "company code", "company_code", "ccode to be billed", "c_code", "ccode", "BillingCompanyCode"
+    "Company Code", "company code", "company_code", "Company", "company", "comp_code", "ccode"
 ]
 SALES_DOC_CANDIDATES = [
     "SalesDocument", "Sales Document Number", "Billing Document", "Billing Doc",
     "Invoice Number", "Invoice", "Document Number"
 ]
 KEEP_COLS = [
-    "BillingDocumentDate", "CreationDate", "Item_Description",
-    "ProductGroup", "DistributionChannel", 
-    "OrderQuantity", "NetPriceAmount", "NetAmount", "TransactionCurrency"
+    "Date", "Product Description", "Product Group",
+    "Volume", "ASP", "Revenue", "Currency"
 ]
 
 # CORS allowed origins including React dev and deployed frontend
@@ -115,14 +114,14 @@ def build_codebook(series: pd.Series) -> Dict[str, str]:
 
 def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int]:
     g = cust_df.copy()
-    date_cols = [c for c in ["BillingDocumentDate", "CreationDate"] if c in g.columns]
+    date_cols = [c for c in ["Date"] if c in g.columns]
     date_col = date_cols[0] if date_cols else None
     if date_col:
         g = g.sort_values(by=[date_col]).reset_index(drop=True)
 
     keep_cols = [c for c in KEEP_COLS if c in g.columns]
     codebooks: Dict[str, Dict[str, str]] = {}
-    cat_cols = [c for c in ["Item_Description", "ProductGroup", "DistributionChannel", "TransactionCurrency"] if c in g.columns]
+    cat_cols = [c for c in ["Product Description", "Product Group", "Currency"] if c in g.columns]
     for c in cat_cols:
         codebooks[c] = build_codebook(g[c])
 
@@ -133,11 +132,11 @@ def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int
     for _, row in g.iterrows():
         fields = []
         for c in keep_cols:
-            if c in ["BillingDocumentDate", "CreationDate"]:
+            if c in ["Date"]:
                 fields.append(norm_date(row.get(c)))
-            elif c in ["OrderQuantity", "NetPriceAmount", "NetAmount"]:
+            elif c in ["Volume", "ASP", "Revenue"]:
                 fields.append(norm_num(row.get(c)))
-            elif c in ["Item_Description", "ProductGroup", "DistributionChannel", "TransactionCurrency"]:
+            elif c in ["Product Description", "Product Group", "Currency"]:
                 raw = sanitize_text(row.get(c))
                 fields.append(codebooks[c].get(raw, "x0"))
             else:
@@ -153,18 +152,18 @@ def quarter_key_from_period_str(s: str) -> str:
 def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
     a: Dict[str, Any] = {}
     g = cust_df.copy()
-    date_cols = [c for c in ["BillingDocumentDate", "CreationDate"] if c in g.columns]
+    date_cols = [c for c in ["Date"] if c in g.columns]
     date_col = date_cols[0] if date_cols else None
 
-    if "TransactionCurrency" in g.columns:
-        cur_counts = g["TransactionCurrency"].dropna().astype(str).value_counts()
+    if "Currency" in g.columns:
+        cur_counts = g["Currency"].dropna().astype(str).value_counts()
         a["currency_mode"] = (cur_counts.index[0] if not cur_counts.empty else "")
     else:
         a["currency_mode"] = ""
 
-    if "NetAmount" in g.columns:
-        g["NetAmount"] = pd.to_numeric(g["NetAmount"], errors="coerce")
-    a["total_revenue_local"] = float(g["NetAmount"].fillna(0).sum()) if "NetAmount" in g.columns else 0.0
+    if "Revenue" in g.columns:
+        g["Revenue"] = pd.to_numeric(g["Revenue"], errors="coerce")
+    a["total_revenue_local"] = float(g["Revenue"].fillna(0).sum()) if "Revenue" in g.columns else 0.0
 
     revenue_by_year: Dict[str, float] = {}
     revenue_by_quarter: Dict[str, float] = {}
@@ -172,10 +171,10 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
     if date_col:
         g[date_col] = pd.to_datetime(g[date_col], errors="coerce")
         g_valid = g[pd.notna(g[date_col])].copy()
-        if "NetAmount" in g_valid.columns:
-            rev_series = g_valid.groupby(g_valid[date_col].dt.year)["NetAmount"].sum(min_count=1)
+        if "Revenue" in g_valid.columns:
+            rev_series = g_valid.groupby(g_valid[date_col].dt.year)["Revenue"].sum(min_count=1)
             revenue_by_year = {str(int(k)): float(v) for k, v in rev_series.fillna(0).to_dict().items()}
-            q_series = g_valid.groupby(g_valid[date_col].dt.to_period("Q"))["NetAmount"].sum(min_count=1)
+            q_series = g_valid.groupby(g_valid[date_col].dt.to_period("Q"))["Revenue"].sum(min_count=1)
             revenue_by_quarter = {quarter_key_from_period_str(str(k)): float(v) for k, v in q_series.fillna(0).to_dict().items()}
 
         dts = g_valid[date_col].sort_values().dropna().astype("datetime64[ns]")
@@ -188,17 +187,17 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
     a["revenue_by_quarter"] = revenue_by_quarter
 
     item_col = None
-    if "Item_Description" in g.columns:
-        item_col = "Item_Description"
-    elif "ProductGroup" in g.columns:
-        item_col = "ProductGroup"
+    if "Product Description" in g.columns:
+        item_col = "Product Description"
+    elif "Product Group" in g.columns:
+        item_col = "Product Group"
 
     a["top_materials_by_revenue"] = []
     a["price_stats"] = []
     a["top_copurchase_pairs"] = []
 
     if item_col:
-        totals = g.groupby(item_col)["NetAmount"].sum(min_count=1).fillna(0).sort_values(ascending=False)
+        totals = g.groupby(item_col)["Revenue"].sum(min_count=1).fillna(0).sort_values(ascending=False)
         grand = float(totals.sum()) if not totals.empty else 0.0
         top_rows = totals.head(10)
         top_materials = []
@@ -207,10 +206,10 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
             top_materials.append({"material": str(mat), "revenue": float(val), "share": round(pct, 4)})
         a["top_materials_by_revenue"] = top_materials
 
-        if "NetAmount" in g.columns:
+        if "Revenue" in g.columns:
             price_stats = []
             for mat, sub in g.groupby(item_col):
-                prices = pd.to_numeric(sub["NetAmount"], errors="coerce").dropna()
+                prices = pd.to_numeric(sub["Revenue"], errors="coerce").dropna()
                 if prices.empty:
                     continue
                 avg = float(prices.mean())
@@ -244,10 +243,8 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
         a["best_price_by_material"] = best_price_materials
 
         date_key = None
-        if "BillingDocumentDate" in g.columns and g["BillingDocumentDate"].notna().any():
-            date_key = "BillingDocumentDate"
-        elif "CreationDate" in g.columns and g["CreationDate"].notna().any():
-            date_key = "CreationDate"
+        if "Date" in g.columns and g["Date"].notna().any():
+            date_key = "Date"
 
         pair_counts = Counter()
         if date_key:
@@ -546,7 +543,7 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
 try:
     raw_df = load_df_from_hana()
 
-    for col in ["BillingDocumentDate", "CreationDate"]:
+    for col in ["Date"]:
         if col in raw_df.columns:
             raw_df[col] = pd.to_datetime(raw_df[col], errors="coerce")
     if CUSTOMER_COL not in raw_df.columns:
@@ -554,7 +551,7 @@ try:
 
     company_col = find_col(raw_df, COMPANY_COL_CANDIDATES)
     if company_col is None:
-        company_col = "BillingCompanyCode"
+        company_col = "Company Code"
         raw_df[company_col] = "UNKNOWN"
 
     if REVENUE_COL not in raw_df.columns:
@@ -563,17 +560,20 @@ try:
     s = raw_df[REVENUE_COL].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
     raw_df[REVENUE_COL] = pd.to_numeric(s, errors="coerce").fillna(0.0)
 
-    if "NetAmount" in raw_df.columns:
-        p = raw_df["NetAmount"].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
-        raw_df["NetAmount"] = pd.to_numeric(p, errors="coerce")
+    # Numeric cleanup for related numeric fields if present
+    for num_col in ["ASP", "Volume"]:
+        if num_col in raw_df.columns:
+            tmp = raw_df[num_col].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
+            raw_df[num_col] = pd.to_numeric(tmp, errors="coerce")
 
     raw_df[CUSTOMER_COL] = raw_df[CUSTOMER_COL].astype(str)
 
-    logger.info("Non-null counts: Customer=%d, Net Value=%d, Created On=%d, Billing Date=%d",
-                raw_df[CUSTOMER_COL].notna().sum(),
-                raw_df[REVENUE_COL].notna().sum(),
-                raw_df["CreationDate"].notna().sum() if "CreationDate" in raw_df.columns else -1,
-                raw_df["BillingDocumentDate"].notna().sum() if "BillingDocumentDate" in raw_df.columns else -1)
+    logger.info(
+        "Non-null counts: Customer=%d, Revenue=%d, Date=%d",
+        raw_df[CUSTOMER_COL].notna().sum(),
+        raw_df[REVENUE_COL].notna().sum(),
+        raw_df["Date"].notna().sum() if "Date" in raw_df.columns else -1
+    )
 
     agg = (
         raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[REVENUE_COL]
@@ -659,11 +659,10 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         if cust_df.empty:
             raise HTTPException(status_code=404, detail="Customer not found")
 
-        nonnull_created = int(cust_df["CreationDate"].notna().sum()) if "CreationDate" in cust_df.columns else 0
-        nonnull_billed = int(cust_df["BillingDocumentDate"].notna().sum()) if "BillingDocumentDate" in cust_df.columns else 0
+        nonnull_date = int(cust_df["Date"].notna().sum()) if "Date" in cust_df.columns else 0
         known_total_revenue = float(cust_df[REVENUE_COL].fillna(0).sum())
-        n_items = int(cust_df["Item_Description"].notna().sum()) if "Item_Description" in cust_df.columns else 0
-        n_prices = int(cust_df["NetAmount"].notna().sum()) if "NetAmount" in cust_df.columns else 0
+        n_items = int(cust_df["Product Description"].notna().sum()) if "Product Description" in cust_df.columns else 0
+        n_prices = int(cust_df["Revenue"].notna().sum()) if "Revenue" in cust_df.columns else 0
 
         aggregates_json = compute_aggregates_for_customer(cust_df)
         compact, nlines = full_transaction_block_for_customer(cust_df)
@@ -686,8 +685,8 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         )
 
         logger.info(
-            "cust_rows=%d rev_sum=%.2f all_rows=%d created_nz=%d billed_nz=%d items=%d prices=%d prompt_chars=%d",
-            len(cust_df), known_total_revenue, nlines, nonnull_created, nonnull_billed, n_items, n_prices, len(prompt)
+            "cust_rows=%d rev_sum=%.2f all_rows=%d date_nz=%d items=%d prices=%d prompt_chars=%d",
+            len(cust_df), known_total_revenue, nlines, nonnull_date, n_items, n_prices, len(prompt)
         )
 
         raw_text = ""
@@ -716,8 +715,7 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
                         "cust_rows": int(len(cust_df)),
                         "known_total_revenue": known_total_revenue,
                         "all_rows": int(nlines),
-                        "nonnull_created": nonnull_created,
-                        "nonnull_billed": nonnull_billed,
+                        "nonnull_date": nonnull_date,
                         "n_items": n_items,
                         "n_prices": n_prices,
                         "raw_text_head": raw_text[:400],
@@ -749,8 +747,7 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
                     "cust_rows": int(len(cust_df)),
                     "known_total_revenue": known_total_revenue,
                     "all_rows": int(nlines),
-                    "nonnull_created": nonnull_created,
-                    "nonnull_billed": nonnull_billed,
+                    "nonnull_date": nonnull_date,
                     "n_items": n_items,
                     "n_prices": n_prices,
                     "raw_text_head": raw_text[:400],
