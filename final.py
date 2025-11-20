@@ -30,9 +30,6 @@ viewname = "SALES_DATA_VIEW"
 
 CUSTOMER_COL = "Customer"
 REVENUE_COL = "Revenue"
-COMPANY_COL_CANDIDATES = [
-    "Company Code", "company code", "company_code", "Company", "company", "comp_code", "ccode"
-]
 KEEP_COLS = [
     "Date", "Product Description", "Product Group",
     "Volume", "ASP", "Revenue", "Currency"
@@ -241,7 +238,7 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
 
     a["total_records"] = int(len(g))
     if date_col and g[date_col].notna().any():
-        a["distinct_days"] = int(g[date_key].dt.date.nunique())
+        a["distinct_days"] = int(g[date_col].dt.date.nunique())
     else:
         a["distinct_days"] = 0
 
@@ -506,6 +503,8 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     g["cluster_name"] = g["cluster_id"].map({0: "high_revenue", 1: "mixed_revenue", 2: "low_revenue"})
     return g.drop(columns=["rev_pos", "km_id"])
 
+# =========================
+# Clustering by customer only (no company code)
 try:
     raw_df = load_df_from_hana()
 
@@ -514,11 +513,6 @@ try:
             raw_df[col] = pd.to_datetime(raw_df[col], errors="coerce")
     if CUSTOMER_COL not in raw_df.columns:
         raise ValueError(f"Missing required column: {CUSTOMER_COL}")
-
-    company_col = find_col(raw_df, COMPANY_COL_CANDIDATES)
-    if company_col is None:
-        company_col = "Company Code"
-        raw_df[company_col] = "UNKNOWN"
 
     if REVENUE_COL not in raw_df.columns:
         raise ValueError(f"Missing revenue column: {REVENUE_COL}")
@@ -540,39 +534,34 @@ try:
     )
 
     agg = (
-        raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)[REVENUE_COL]
+        raw_df.groupby(CUSTOMER_COL, dropna=False)[REVENUE_COL]
               .sum(min_count=1)
               .reset_index()
               .rename(columns={REVENUE_COL: "total_revenue"})
     )
     agg["total_revenue"] = agg["total_revenue"].fillna(0.0).astype(float)
 
-    # PURCHASING FREQUENCY: Count of rows per company+customer (change)
     pf = (
-        raw_df.groupby([company_col, CUSTOMER_COL], dropna=False)
+        raw_df.groupby(CUSTOMER_COL, dropna=False)
               .size()
-              .reset_index()
-              .rename(columns={0: "purchasing_frequency"})
+              .reset_index(name="purchasing_frequency")
     )
 
-    clustered_list = []
-    for _, g in agg.groupby(company_col, dropna=False):
-        clustered_list.append(cluster_one_company(g))
-    clustered = pd.concat(clustered_list, ignore_index=True)
+    clustered = cluster_one_company(agg)
 
     clustered["revenue_rank_in_cluster"] = (
-        clustered.groupby([company_col, "cluster_id"])["total_revenue"]
+        clustered.groupby(["cluster_id"])["total_revenue"]
                  .rank(method="dense", ascending=False)
                  .astype(int)
     )
 
     clustered = (
-        clustered.merge(pf, on=[company_col, CUSTOMER_COL], how="left")
-                 .rename(columns={company_col: "company_code", CUSTOMER_COL: "customer"})
+        clustered.merge(pf, on=[CUSTOMER_COL], how="left")
+                 .rename(columns={CUSTOMER_COL: "customer"})
     )
 
     clustered_data = clustered[[
-        "company_code", "customer", "total_revenue", "cluster_name",
+        "customer", "total_revenue", "cluster_name",
         "revenue_rank_in_cluster", "purchasing_frequency"
     ]].copy()
 
@@ -583,6 +572,8 @@ except Exception as e:
     raw_df = pd.DataFrame()
     clustered_data = pd.DataFrame()
 
+# =========================
+# FastAPI app & CORS middleware
 app = FastAPI(title="Customer Clustering and Insights API")
 
 app.add_middleware(
@@ -613,6 +604,11 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     logger.info("GET /customer-insights/%s debug=%s", customer_id, debug)
     try:
         cust_df = raw_df[raw_df[CUSTOMER_COL].astype(str) == str(customer_id)]
+
+        # Optional: Limit to most recent N records for LLM speedup (uncomment if needed)
+        # N = 100
+        # if "Date" in cust_df.columns and len(cust_df) > N:
+        #     cust_df = cust_df.sort_values(by="Date", ascending=False).head(N).copy()
 
         if cust_df.empty:
             raise HTTPException(status_code=404, detail="Customer not found")
@@ -718,4 +714,3 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     except Exception as e:
         logger.exception("Unexpected error in get_customer_insights for customer %s: %s", customer_id, e)
         raise HTTPException(status_code=500, detail="Internal server error")
-
