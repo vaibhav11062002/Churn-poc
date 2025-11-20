@@ -9,7 +9,6 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
-import io
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.cluster import KMeans
@@ -60,15 +59,6 @@ except Exception as e:
     logger.exception("Failed to configure Generative AI client: %s", e)
     raise
 
-def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols_lc = {c.lower(): c for c in df.columns}
-    for name in candidates:
-        if name in df.columns:
-            return name
-        if name.lower() in cols_lc:
-            return cols_lc[name.lower()]
-    return None
-
 def sanitize_text(x: Any) -> str:
     if pd.isna(x):
         return ""
@@ -101,16 +91,13 @@ def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int
     date_col = date_cols[0] if date_cols else None
     if date_col:
         g = g.sort_values(by=[date_col]).reset_index(drop=True)
-
     keep_cols = [c for c in KEEP_COLS if c in g.columns]
     codebooks: Dict[str, Dict[str, str]] = {}
     cat_cols = [c for c in ["Product Description", "Product Group", "Currency"] if c in g.columns]
     for c in cat_cols:
         codebooks[c] = build_codebook(g[c])
-
     header = "COLUMNS|" + "|".join([sanitize_text(c) for c in keep_cols])
     code_header = "CODES|" + json.dumps(codebooks, separators=(",", ":"), ensure_ascii=False)
-
     data_lines = []
     for _, row in g.iterrows():
         fields = []
@@ -125,7 +112,6 @@ def full_transaction_block_for_customer(cust_df: pd.DataFrame) -> Tuple[str, int
             else:
                 fields.append(sanitize_text(row.get(c)))
         data_lines.append("ROW|" + "|".join(fields))
-
     compact_text = "\n".join([header, code_header] + data_lines)
     return compact_text, len(data_lines)
 
@@ -137,20 +123,16 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
     g = cust_df.copy()
     date_cols = [c for c in ["Date"] if c in g.columns]
     date_col = date_cols[0] if date_cols else None
-
     if "Currency" in g.columns:
         cur_counts = g["Currency"].dropna().astype(str).value_counts()
         a["currency_mode"] = (cur_counts.index[0] if not cur_counts.empty else "")
     else:
         a["currency_mode"] = ""
-
     if "Revenue" in g.columns:
         g["Revenue"] = pd.to_numeric(g["Revenue"], errors="coerce")
     a["total_revenue_local"] = float(g["Revenue"].fillna(0).sum()) if "Revenue" in g.columns else 0.0
-
     revenue_by_year: Dict[str, float] = {}
     revenue_by_quarter: Dict[str, float] = {}
-
     if date_col:
         g[date_col] = pd.to_datetime(g[date_col], errors="coerce")
         g_valid = g[pd.notna(g[date_col])].copy()
@@ -159,26 +141,21 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
             revenue_by_year = {str(int(k)): float(v) for k, v in rev_series.fillna(0).to_dict().items()}
             q_series = g_valid.groupby(g_valid[date_col].dt.to_period("Q"))["Revenue"].sum(min_count=1)
             revenue_by_quarter = {quarter_key_from_period_str(str(k)): float(v) for k, v in q_series.fillna(0).to_dict().items()}
-
         dts = g_valid[date_col].sort_values().dropna().astype("datetime64[ns]")
         diffs = dts.diff().dt.days.dropna()
         a["median_days_between_orders"] = float(np.median(diffs)) if not diffs.empty else 0.0
     else:
         a["median_days_between_orders"] = 0.0
-
     a["revenue_by_year"] = revenue_by_year
     a["revenue_by_quarter"] = revenue_by_quarter
-
     item_col = None
     if "Product Description" in g.columns:
         item_col = "Product Description"
     elif "Product Group" in g.columns:
         item_col = "Product Group"
-
     a["top_materials_by_revenue"] = []
     a["price_stats"] = []
     a["top_copurchase_pairs"] = []
-
     if item_col:
         totals = g.groupby(item_col)["Revenue"].sum(min_count=1).fillna(0).sort_values(ascending=False)
         grand = float(totals.sum()) if not totals.empty else 0.0
@@ -188,24 +165,37 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
             pct = (float(val) / grand) if grand > 0 else 0.0
             top_materials.append({"material": str(mat), "revenue": float(val), "share": round(pct, 4)})
         a["top_materials_by_revenue"] = top_materials
-
-        if "Revenue" in g.columns:
-            price_stats = []
-            for mat, sub in g.groupby(item_col):
-                prices = pd.to_numeric(sub["Revenue"], errors="coerce").dropna()
-                if prices.empty:
-                    continue
-                avg = float(prices.mean())
-                std = float(prices.std(ddof=0)) if len(prices) > 1 else 0.0
-                cv = (std / avg) if avg > 0 else 0.0
-                price_stats.append({"material": str(mat), "avg_price": round(avg, 4), "cv": round(cv, 4)})
-            if top_materials:
-                top_set = {t["material"] for t in top_materials}
-                price_stats_sorted = sorted(price_stats, key=lambda d: (d["material"] not in top_set, d["material"]))
-                a["price_stats"] = price_stats_sorted[:20]
-            else:
-                a["price_stats"] = price_stats[:20]
-
+        # --- Price stats based on ASP and COGS_SP ---
+        if "ASP" in g.columns:
+            g["ASP"] = pd.to_numeric(g["ASP"], errors="coerce")
+        if "COGS_SP" in g.columns:
+            g["COGS_SP"] = pd.to_numeric(g["COGS_SP"], errors="coerce")
+        price_stats = []
+        for mat, sub in g.groupby(item_col):
+            asps = pd.to_numeric(sub.get("ASP"), errors="coerce").dropna() if "ASP" in sub.columns else pd.Series(dtype=float)
+            cogs_sp = pd.to_numeric(sub.get("COGS_SP"), errors="coerce").dropna() if "COGS_SP" in sub.columns else pd.Series(dtype=float)
+            if asps.empty:
+                continue
+            avg_asp = float(asps.mean())
+            std_asp = float(asps.std(ddof=0)) if len(asps) > 1 else 0.0
+            cv_asp = (std_asp / avg_asp) if avg_asp > 0 else 0.0
+            avg_cogs = float(cogs_sp.mean()) if not cogs_sp.empty else 0.0
+            unit_margin = max(avg_asp - avg_cogs, 0.0)
+            margin_pct = (unit_margin / avg_asp) if avg_asp > 0 else 0.0
+            price_stats.append({
+                "material": str(mat),
+                "avg_price": round(avg_asp, 4),
+                "avg_cogs_sp": round(avg_cogs, 4),
+                "unit_margin": round(unit_margin, 4),
+                "margin_pct": round(margin_pct, 4),
+                "cv": round(cv_asp, 4)
+            })
+        if top_materials:
+            top_set = {t["material"] for t in top_materials}
+            price_stats_sorted = sorted(price_stats, key=lambda d: (d["material"] not in top_set, d["material"]))
+            a["price_stats"] = price_stats_sorted[:20]
+        else:
+            a["price_stats"] = price_stats[:20]
         price_stats_map = {p["material"]: p["avg_price"] for p in a.get("price_stats", [])}
         best_price_materials = []
         for entry in a.get("best_price_by_material", []):
@@ -220,7 +210,7 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
                 "discount": discount,
             })
         a["best_price_by_material"] = best_price_materials
-
+        # Co-purchase pairs
         date_key = None
         if "Date" in g.columns and g["Date"].notna().any():
             date_key = "Date"
@@ -235,13 +225,11 @@ def compute_aggregates_for_customer(cust_df: pd.DataFrame) -> Dict[str, Any]:
                     pair_counts[(a_mat, b_mat)] += 1
         top_pairs = [{"a": a_m, "b": b_m, "count": int(c)} for (a_m, b_m), c in pair_counts.most_common(5)]
         a["top_copurchase_pairs"] = top_pairs
-
     a["total_records"] = int(len(g))
     if date_col and g[date_col].notna().any():
         a["distinct_days"] = int(g[date_col].dt.date.nunique())
     else:
         a["distinct_days"] = 0
-
     return a
 
 def parse_insights_to_kv_list(text: str) -> List[Dict[str, str]]:
@@ -320,18 +308,6 @@ Frame all commentary as if speaking to sales and regional leadership teams respo
 For "observation" and "recommendation", return JSON arrays where each item is an object with "key" and "value", representing bullet-point insights and recommendations in clear business terms.
 
 Each bullet point should reflect tactical or strategic actions tied to account health, margin preservation, or share-of-wallet defense.
-
-Competitive Pricing Context (apply only when competitors exist for customer's products):
-
-BEV SYRUP: Sysco (15% cheaper), US Foods (8% cheaper), Performance Food Group (12% cheaper)
-
-SAUCES: Sysco (10% cheaper), US Foods (5% cheaper), Gordon Food Service (7% cheaper)
-
-SYRUPS: US Foods (12% cheaper), Sysco (18% cheaper), Reinhart (9% cheaper)
-
-TOPPINGS: Gordon Food Service (6% cheaper), US Foods (4% cheaper), Sysco (11% cheaper)
-
-FILLINGS: Performance Food Group (13% cheaper), Sysco (8% cheaper), US Foods (10% cheaper)
 
 NOTE: If customer's primary products are NOT in the above competitive categories, treat as EXCLUSIVE products with no market competition and ignore competitive factors.
 
@@ -504,35 +480,30 @@ def cluster_one_company(g: pd.DataFrame) -> pd.DataFrame:
     return g.drop(columns=["rev_pos", "km_id"])
 
 # =========================
-# Clustering by customer only (no company code)
+# MAIN DATA LOAD & CLUSTERING PER CUSTOMER
 try:
     raw_df = load_df_from_hana()
-
     for col in ["Date"]:
         if col in raw_df.columns:
             raw_df[col] = pd.to_datetime(raw_df[col], errors="coerce")
     if CUSTOMER_COL not in raw_df.columns:
         raise ValueError(f"Missing required column: {CUSTOMER_COL}")
-
     if REVENUE_COL not in raw_df.columns:
         raise ValueError(f"Missing revenue column: {REVENUE_COL}")
-
+    # Numeric cleanup
     s = raw_df[REVENUE_COL].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
     raw_df[REVENUE_COL] = pd.to_numeric(s, errors="coerce").fillna(0.0)
-    for num_col in ["ASP", "Volume"]:
+    for num_col in ["ASP", "Volume", "COGS_SP", "COGS"]:
         if num_col in raw_df.columns:
             tmp = raw_df[num_col].astype(str).str.replace(",", "", regex=False).str.replace(r"[^\d\.\-]", "", regex=True)
             raw_df[num_col] = pd.to_numeric(tmp, errors="coerce")
-
     raw_df[CUSTOMER_COL] = raw_df[CUSTOMER_COL].astype(str)
-
     logger.info(
         "Non-null counts: Customer=%d, Revenue=%d, Date=%d",
         raw_df[CUSTOMER_COL].notna().sum(),
         raw_df[REVENUE_COL].notna().sum(),
         raw_df["Date"].notna().sum() if "Date" in raw_df.columns else -1
     )
-
     agg = (
         raw_df.groupby(CUSTOMER_COL, dropna=False)[REVENUE_COL]
               .sum(min_count=1)
@@ -540,33 +511,26 @@ try:
               .rename(columns={REVENUE_COL: "total_revenue"})
     )
     agg["total_revenue"] = agg["total_revenue"].fillna(0.0).astype(float)
-
     pf = (
         raw_df.groupby(CUSTOMER_COL, dropna=False)
               .size()
               .reset_index(name="purchasing_frequency")
     )
-
     clustered = cluster_one_company(agg)
-
     clustered["revenue_rank_in_cluster"] = (
         clustered.groupby(["cluster_id"])["total_revenue"]
                  .rank(method="dense", ascending=False)
                  .astype(int)
     )
-
     clustered = (
         clustered.merge(pf, on=[CUSTOMER_COL], how="left")
                  .rename(columns={CUSTOMER_COL: "customer"})
     )
-
     clustered_data = clustered[[
         "customer", "total_revenue", "cluster_name",
         "revenue_rank_in_cluster", "purchasing_frequency"
     ]].copy()
-
     logger.info("clustered_data rows=%d, sample=%s", len(clustered_data), clustered_data.head(3).to_dict("records"))
-
 except Exception as e:
     logger.exception("Error during data load and clustering: %s", e)
     raw_df = pd.DataFrame()
@@ -575,7 +539,6 @@ except Exception as e:
 # =========================
 # FastAPI app & CORS middleware
 app = FastAPI(title="Customer Clustering and Insights API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -585,7 +548,6 @@ app.add_middleware(
     expose_headers=["Content-Disposition"],
     max_age=600,
 )
-
 @app.get("/")
 async def root():
     return {"status": "ok"}
@@ -604,23 +566,18 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
     logger.info("GET /customer-insights/%s debug=%s", customer_id, debug)
     try:
         cust_df = raw_df[raw_df[CUSTOMER_COL].astype(str) == str(customer_id)]
-
-        # Optional: Limit to most recent N records for LLM speedup (uncomment if needed)
+        # Optional limit to most recent N records:
         # N = 100
         # if "Date" in cust_df.columns and len(cust_df) > N:
         #     cust_df = cust_df.sort_values(by="Date", ascending=False).head(N).copy()
-
         if cust_df.empty:
             raise HTTPException(status_code=404, detail="Customer not found")
-
         nonnull_date = int(cust_df["Date"].notna().sum()) if "Date" in cust_df.columns else 0
         known_total_revenue = float(cust_df[REVENUE_COL].fillna(0).sum())
         n_items = int(cust_df["Product Description"].notna().sum()) if "Product Description" in cust_df.columns else 0
         n_prices = int(cust_df["Revenue"].notna().sum()) if "Revenue" in cust_df.columns else 0
-
         aggregates_json = compute_aggregates_for_customer(cust_df)
         compact, nlines = full_transaction_block_for_customer(cust_df)
-
         row = clustered_data[clustered_data["customer"] == str(customer_id)].head(1).to_dict("records")
         ctx = row[0] if row else {}
         context_json = {
@@ -629,7 +586,6 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
             "purchasing_frequency": int(ctx.get("purchasing_frequency", 0) or 0),
             "known_total_revenue_from_cluster": float(ctx.get("total_revenue", known_total_revenue)),
         }
-
         prompt = build_main_prompt(
             customer_id=customer_id,
             known_total_revenue=known_total_revenue,
@@ -637,12 +593,10 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
             compact_block=compact,
             context_json=context_json,
         )
-
         logger.info(
             "cust_rows=%d rev_sum=%.2f all_rows=%d date_nz=%d items=%d prices=%d prompt_chars=%d",
             len(cust_df), known_total_revenue, nlines, nonnull_date, n_items, n_prices, len(prompt)
         )
-
         raw_text = ""
         parsed = None
         try:
@@ -653,14 +607,11 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
             parsed = try_parse_json(raw_text)
         except Exception as e:
             logger.error("LLM call failed: %s", e)
-
         cluster_name = context_json.get("cluster_name", "")
         if isinstance(parsed, dict):
             coerced = coerce_to_schema_with_cluster(parsed, customer_id=customer_id, cluster_name=cluster_name)
-
             coerced["observation"] = parse_nested_json_list_field(coerced.get("observation", ""))
             coerced["recommendation"] = parse_nested_json_list_field(coerced.get("recommendation", ""))
-
             if debug:
                 return {
                     "result": coerced,
@@ -676,7 +627,6 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
                     },
                 }
             return coerced
-
         fallback = {
             "customer": customer_id,
             "cluster": cluster_name,
@@ -708,7 +658,6 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
                 },
             }
         return fallback
-
     except HTTPException:
         raise
     except Exception as e:
