@@ -17,7 +17,7 @@ import google.generativeai as genai
 # =========================
 # Manual Config Variables
 # =========================
-GEMINI_API_KEY = "AIzaSyAn-xZZaxw6fP8MOkU3XQzXl9r-I2rvcrg"
+GEMINI_API_KEY = "AIzaSyAGzIx614VbbSE-4kiJ2mLMvSA1QqdSAUw"
 MODEL_NAME = "gemini-2.5-flash"
 
 dbuser = "DSP_CUST_CONTENT#DSP_CUST_CONTENT"
