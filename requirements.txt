@@ -1,9 +1,12 @@
 fastapi
 uvicorn[standard]
-google-cloud-storage
+google-cloud-storage  # Keep if you use GCS for data storage, otherwise remove
 pandas
 numpy
 scikit-learn
 gunicorn
-google-generativeai
+groq  # ✅ ADD THIS - replaces google-generativeai
+langchain-groq  # ✅ ADD THIS - for LangChain integration (if using LangChain)
+langchain-experimental  # Keep if you use pandas dataframe agent
 hdbcli
+python-dotenv  # ✅ RECOMMENDED - for .env file support
