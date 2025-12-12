@@ -12,14 +12,14 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sklearn.cluster import KMeans
-from groq import Groq
+import google.generativeai as genai
 
 # =========================
 # Manual Config Variables
 # =========================
 import os
-GROQ_API_KEY = os.getenv('GROQ_API_KEY') # Replace with your actual Groq API key
-MODEL_NAME = "llama-3.3-70b-versatile"
+GEMINI_API_KEY = os.getenv('GROQ_API_KEY')
+MODEL_NAME = "gemini-2.5-flash"
 
 dbuser = "DSP_CUST_CONTENT#DSP_CUST_CONTENT"
 dbpassword = "g6D,$a%@D`3$!)-GaVO#_[]T+=3z~[Z6"
@@ -49,14 +49,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("customer-insights")
 
-if not GROQ_API_KEY:
-    raise RuntimeError("GROQ_API_KEY is required for LLM authentication")
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY is required for LLM authentication")
 
 try:
-    client = Groq(api_key=GROQ_API_KEY)
-    logger.info("Configured Groq AI client with API key")
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(MODEL_NAME)
+    logger.info("Configured Google Generative AI client with API key")
 except Exception as e:
-    logger.exception("Failed to configure Groq client: %s", e)
+    logger.exception("Failed to configure Generative AI client: %s", e)
     raise
 
 def sanitize_text(x: Any) -> str:
@@ -600,23 +601,14 @@ async def get_customer_insights(customer_id: str, debug: bool = Query(False)):
         raw_text = ""
         parsed = None
         try:
-            resp = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0.3,
-                max_tokens=4096  # Adjust based on your needs
-            )
-            raw_text = (resp.choices[0].message.content or "")
+            resp = model.generate_content(prompt)
+            raw_text = (resp.text or "")
             logger.info("LLM raw_text_len=%d", len(raw_text))
             logger.debug("LLM raw_text_head=%s", raw_text[:400].replace("\n", " "))
             parsed = try_parse_json(raw_text)
         except Exception as e:
             logger.error("LLM call failed: %s", e)
+        cluster_name = context_json.get("cluster_name", "")
         if isinstance(parsed, dict):
             coerced = coerce_to_schema_with_cluster(parsed, customer_id=customer_id, cluster_name=cluster_name)
             coerced["observation"] = parse_nested_json_list_field(coerced.get("observation", ""))
