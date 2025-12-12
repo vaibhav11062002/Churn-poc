@@ -17,7 +17,7 @@ from groq import Groq
 # =========================
 # Manual Config Variables
 # =========================
-GROQ_API_KEY = "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"  # Replace with your actual Groq API key
+GROQ_API_KEY = ${{ secrets.GROQ_API_KEY }}  # Replace with your actual Groq API key
 MODEL_NAME = "llama-3.3-70b-versatile"
 
 dbuser = "DSP_CUST_CONTENT#DSP_CUST_CONTENT"
