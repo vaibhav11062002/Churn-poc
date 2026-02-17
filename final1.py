@@ -20,7 +20,7 @@ import google.generativeai as genai
 # =========================
 # SAP HANA Connection Parameters
 GEMINI_API_KEY = "AIzaSyAsaqUkDY7IuFc12P9a7jBmJER9i2ft3BE"
-MODEL_NAME = "gemini-2.5-flash"
+MODEL_NAME = "gemini-2.0-flash"
 
 dbuser = "DSP_CUST_CONTENT#DSP_CUST_CONTENT"
 dbpassword = "g6D,$a%@D`3$!)-GaVO#_[]T+=3z~[Z6"
