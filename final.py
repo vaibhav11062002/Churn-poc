@@ -19,7 +19,7 @@ import google.generativeai as genai
 # =========================
 import os
 GEMINI_API_KEY = os.getenv('GROQ_API_KEY')
-MODEL_NAME = "gemini-2.0-flash"
+MODEL_NAME = "gemini-2.5-flash"
 
 dbuser = "DSP_CUST_CONTENT#DSP_CUST_CONTENT"
 dbpassword = "g6D,$a%@D`3$!)-GaVO#_[]T+=3z~[Z6"
