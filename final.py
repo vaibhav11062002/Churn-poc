@@ -38,7 +38,9 @@ KEEP_COLS = [
 origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://chrun-ai.vercel.app"
+    "https://chrun-ai.vercel.app",
+    "*",
+    "https://chrunai-frontend.cfapps.us10-001.hana.ondemand.com"
 ]
 ALLOW_CREDENTIALS = True
 
